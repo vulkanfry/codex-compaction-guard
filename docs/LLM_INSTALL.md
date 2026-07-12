@@ -70,10 +70,11 @@ Start a fresh Codex CLI session and run:
 /hooks
 ```
 
-Ask the user to review and trust these six exact events:
+Ask the user to review and trust these seven exact events:
 
 - `PreCompact`
 - `PostCompact`
+- `PreToolUse`
 - `Stop`
 - `SubagentStop`
 - `SessionStart`
@@ -90,7 +91,8 @@ definition change correctly returns the hook to review state.
 
 ### 5. Registration check
 
-Use `/hooks` or the app-server `hooks/list` method. Confirm for all six hooks:
+Use `/hooks` or the app-server `hooks/list` method. Confirm for all seven
+hooks:
 
 - enabled: true
 - trust status: trusted
@@ -122,9 +124,11 @@ Required evidence:
 - `schema_version` is `2`;
 - `checkpoint_id` is non-empty;
 - audit contains `checkpoint_saved` and `restore_armed`;
-- exactly one path consumes the pending snapshot;
-- `Stop` or fallback injection contains the local-compaction and past-steps
-  semantics;
+- exactly one path consumes the pending snapshot; when the task keeps running
+  after compaction the expected consumer is `PreToolUse` in the same turn,
+  otherwise `Stop` or a fallback surface;
+- the consumed record's `consumed_via` matches that surface;
+- the injection contains the local-compaction and past-steps semantics;
 - the model continues from an unresolved step instead of asking what to do.
 
 ## Failure handling
@@ -141,7 +145,7 @@ Required evidence:
 
 Report these separately:
 
-- Registered: binary path and six discovered hooks.
+- Registered: binary path and seven discovered hooks.
 - Trusted: whether the exact current definitions are trusted.
 - Real action worked: evidence from one matching compaction lifecycle.
 - Not verified: anything not proven on the installed surface.

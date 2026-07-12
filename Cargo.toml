@@ -1,6 +1,6 @@
 [package]
 name = "codex-compaction-guard"
-version = "0.2.2"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.88"
 description = "Native Rust lifecycle hook that preserves and enriches Codex task state across context compaction"

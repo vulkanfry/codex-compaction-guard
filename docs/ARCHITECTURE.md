@@ -12,6 +12,11 @@ PostCompact
   -> classify empty / weak / healthy
   -> atomic pending.json
 
+PreToolUse (same turn)
+  -> match session, turn, checkpoint identity, and cwd
+  -> atomically rename pending.json to consumed-*.json
+  -> return only hookSpecificOutput.additionalContext
+
 Stop or SubagentStop
   -> reject recursive stop_hook_active
   -> atomically rename pending.json to consumed-*.json
@@ -44,6 +49,31 @@ root. Sensitive names, binary files, and files above 2 MiB are excluded.
 
 Both modes inject local state because deterministic operational detail can be
 useful even when the model-generated summary is good.
+
+## Same-turn delivery order
+
+Stable Codex accepts only the common output fields from `PostCompact`, so
+`PostCompact` can arm state but cannot inject context. Delivery surfaces then
+race for the same one-shot pending file:
+
+1. `PreToolUse` delivers at the first tool boundary of the same turn. The
+   event must match the pending `session_id`, `turn_id`, `checkpoint_id`, and
+   normalized `cwd`; any mismatch fails open and preserves the pending state
+   for a later surface.
+2. `Stop` and `SubagentStop` deliver when the turn ends without another tool
+   call.
+3. `SessionStart` (compact/resume) and `UserPromptSubmit` deliver across turns
+   and resumed sessions without turn binding.
+
+The `PreToolUse` response contains only `hookSpecificOutput.additionalContext`.
+Stable Codex rejects `continue:false`, `stopReason`, and `suppressOutput` from
+`PreToolUse` outputs, and the guard must never gate or rewrite the tool call it
+rides on, so it never emits `decision`, `permissionDecision`, or
+`updatedInput`.
+
+`PreToolUse` runs before every tool call permanently. Without pending state the
+hook performs one failed `open()` of `pending.json` and exits; the checkpoint
+file is parsed only after live pending state exists.
 
 ## One-shot concurrency
 

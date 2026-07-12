@@ -12,19 +12,32 @@ goal, recent file changes, git state, proof logs, and the next unresolved step.
 1. `PreCompact` writes an atomic private checkpoint.
 2. `PostCompact` classifies the built-in summary as `empty`, `weak`, or
    `healthy`, then always arms a one-shot continuation.
-3. The first `Stop` or `SubagentStop` injects the checkpoint and blocks the
-   premature stop once.
-4. `SessionStart` and `UserPromptSubmit` are fallback injection paths when the
+3. The first `PreToolUse` of the same turn injects the checkpoint as
+   `additionalContext` at the next tool boundary, before the turn ends.
+4. If the turn runs no further tool call, the first `Stop` or `SubagentStop`
+   injects the checkpoint and blocks the premature stop once.
+5. `SessionStart` and `UserPromptSubmit` are fallback injection paths when the
    original turn was interrupted.
 
 ### Delivery timing
 
-Current Codex releases do not accept `additionalContext` directly from
-`PostCompact`. The hook therefore arms enrichment at `PostCompact` and delivers
-it at the first matching `Stop`, `SubagentStop`, `SessionStart`, or
-`UserPromptSubmit`. If the same model turn keeps running immediately after
-compaction, the schema-v2 checkpoint is real but the local enrichment remains
-in `pending.json` until one of those delivery events occurs.
+Current Codex releases accept only the common output fields from `PostCompact`,
+so a hook cannot attach `additionalContext` to the compaction event itself. The
+guard therefore arms enrichment at `PostCompact` and delivers it at the first
+supported surface:
+
+1. `PreToolUse` in the same turn. Auto-compaction usually interrupts a running
+   turn that continues with more tool calls, so the enrichment reaches the
+   model at the first tool boundary instead of waiting for the turn to end.
+2. `Stop` or `SubagentStop` when the turn ends without another tool call.
+3. `SessionStart` (compact/resume) and `UserPromptSubmit` across turns.
+
+All delivery surfaces race for the same one-shot pending file, so exactly one
+of them injects. The `PreToolUse` response deliberately contains only
+`hookSpecificOutput.additionalContext`: stable Codex rejects `continue:false`,
+`stopReason`, and `suppressOutput` from `PreToolUse` outputs, and the guard
+must never gate or rewrite the tool call it rides on, so it never emits
+`decision`, `permissionDecision`, or `updatedInput`.
 
 Every injected snapshot explicitly tells the model that:
 
@@ -40,7 +53,10 @@ Every injected snapshot explicitly tells the model that:
 - Fails open and emits exactly one JSON line on hook errors.
 - Private state directories use mode `0700`; state files use `0600`.
 - Checkpoints and pending state are written atomically.
-- Concurrent stop hooks can consume a pending enrichment only once.
+- Concurrent delivery hooks, across tool-boundary and stop surfaces, can
+  consume a pending enrichment only once.
+- The tool-call fast path stays cheap: without pending state the hook performs
+  a single failed `open()` and never parses the checkpoint.
 - Secret patterns and sensitive files are redacted or excluded before state is
   persisted.
 - Git subprocesses have per-command and process-wide deadlines.
@@ -71,11 +87,11 @@ The installer:
 - builds with `cargo build --release --locked`;
 - installs the binary at `~/.codex/hooks/compaction_guard`;
 - backs up the existing `~/.codex/hooks.json`;
-- merges six guard hook groups without replacing unrelated hooks;
+- merges seven guard hook groups without replacing unrelated hooks;
 - enables the documented `hooks` feature.
 
 Codex intentionally does not trust changed hooks automatically. Open a fresh
-Codex CLI session, run `/hooks`, review all six definitions, and trust them.
+Codex CLI session, run `/hooks`, review all seven definitions, and trust them.
 
 The installer deliberately does not change `remote_compaction_v2` or any other
 unrelated Codex feature. Configure those separately in Codex if desired; the
@@ -88,16 +104,21 @@ CODEX_COMPACTION_GUARD_EXECUTABLE="$HOME/.codex/hooks/compaction_guard" \
   python3 -m unittest -v tests/test_hook_lifecycle.py
 ```
 
-The lifecycle suite covers 14 scenarios:
+The lifecycle suite covers 19 scenarios:
 
 - empty, weak, and healthy built-in summaries;
 - enrichment versus recovery mode;
+- same-turn `PreToolUse` delivery with a strict schema-safe output shape and
+  no later duplicate `Stop` injection;
+- turn binding for the tool-boundary surface;
+- agent-scoped state isolation for subagent tool calls;
 - chronological recent context;
 - staged, unstaged, and untracked files;
 - secret redaction and sensitive-file exclusion;
-- fallback injection;
+- fallback injection, including `UserPromptSubmit` after a manual compaction;
 - recursive `stop_hook_active` handling;
 - eight concurrent `Stop` processes with exactly one injection;
+- eight concurrent `PreToolUse` processes with exactly one injection;
 - footer preservation at the 40k context budget.
 - private `0700` state directories and `0600` checkpoint files.
 - `CODEX_HOME`-scoped state placement.
@@ -122,9 +143,9 @@ Use [docs/LLM_INSTALL.md](docs/LLM_INSTALL.md), or paste this short request:
 Install this repository as a user-level Codex compaction guard. Read
 docs/LLM_INSTALL.md first. Preserve unrelated hooks, do not bypass or fabricate
 hook trust, run scripts/verify.sh, install the release binary, ask me to review
-the six hooks through /hooks, then prove one real PreCompact -> PostCompact ->
-Stop flow. Report registered, trusted, real-action-worked, and not-verified
-separately.
+the seven hooks through /hooks, then prove one real PreCompact -> PostCompact
+-> delivery flow (PreToolUse in the same turn, or Stop/fallback). Report
+registered, trusted, real-action-worked, and not-verified separately.
 ```
 
 Machine-oriented project context is also available in [llms.txt](llms.txt).

@@ -27,6 +27,18 @@
         ]
       }
     ],
+    "PreToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "__CODEX_COMPACTION_GUARD_BINARY__",
+            "timeout": 15,
+            "statusMessage": "Checking same-turn compaction delivery"
+          }
+        ]
+      }
+    ],
     "Stop": [
       {
         "hooks": [

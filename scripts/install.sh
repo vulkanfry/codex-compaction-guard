@@ -14,7 +14,7 @@ usage() {
     "Usage: scripts/install.sh" \
     "" \
     "Builds the release binary, installs it under CODEX_HOME, and merges" \
-    "the six guard lifecycle hooks into CODEX_HOME/hooks.json." \
+    "the seven guard lifecycle hooks into CODEX_HOME/hooks.json." \
     "" \
     "Environment:" \
     "  CODEX_HOME   Codex state directory (default: ~/.codex)"
@@ -120,6 +120,6 @@ printf '%s\n' \
   "Merged hooks:     $HOOKS_PATH" \
   "Private state:    $STATE_DIR" \
   "" \
-  "Security step: open /hooks in a fresh Codex CLI session, review all six" \
+  "Security step: open /hooks in a fresh Codex CLI session, review all seven" \
   "definitions, and trust them. Codex intentionally skips changed hooks until" \
   "their current definitions are reviewed."

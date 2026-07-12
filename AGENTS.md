@@ -23,7 +23,11 @@ cargo test
 - Hook mode with no arguments reads one JSON object from stdin and emits exactly
   one compact JSON object on stdout.
 - Hook errors fail open, exit zero, and do not print diagnostics to stderr.
-- `Stop` and `SubagentStop` enrichment is atomic and one-shot.
+- `PreToolUse`, `Stop`, and `SubagentStop` enrichment is atomic and one-shot.
+- `PreToolUse` delivery is bound to the pending turn and emits only
+  `hookSpecificOutput.additionalContext`; it must never emit `continue:false`,
+  `decision`, `permissionDecision`, `updatedInput`, `stopReason`, or
+  `suppressOutput`.
 - `stop_hook_active=true` never consumes pending state.
 - User-level installation must preserve unrelated hooks.
 - Hook trust requires explicit user review; never synthesize trust hashes.

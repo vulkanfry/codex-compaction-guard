@@ -15,10 +15,17 @@ Runtime entrypoint:
 Hook events:
 - PreCompact
 - PostCompact
+- PreToolUse
 - Stop
 - SubagentStop
 - SessionStart
 - UserPromptSubmit
+
+Delivery order after PostCompact arms pending state:
+- PreToolUse in the same turn (first tool boundary, additionalContext only)
+- Stop or SubagentStop at turn end
+- SessionStart or UserPromptSubmit as cross-turn fallback
+- exactly one surface consumes the one-shot pending file
 
 Required verification:
 1. cargo fmt -- --check

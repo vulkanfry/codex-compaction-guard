@@ -73,6 +73,19 @@ jq -n \
           ]
         }
       ],
+      PreToolUse: [
+        {
+          matcher: "exec_command",
+          hooks: [
+            {
+              type: "command",
+              command: $other_command,
+              timeout: 3,
+              statusMessage: "Keep unrelated tool hook"
+            }
+          ]
+        }
+      ],
       Stop: [
         {
           hooks: [
@@ -121,6 +134,19 @@ jq -n --arg other_command "$other_command" '
           ]
         }
       ],
+      PreToolUse: [
+        {
+          matcher: "exec_command",
+          hooks: [
+            {
+              type: "command",
+              command: $other_command,
+              timeout: 3,
+              statusMessage: "Keep unrelated tool hook"
+            }
+          ]
+        }
+      ],
       Stop: [
         {
           hooks: [
@@ -141,6 +167,7 @@ assert_installed_shape() {
     ([
       "PreCompact",
       "PostCompact",
+      "PreToolUse",
       "Stop",
       "SubagentStop",
       "SessionStart",
@@ -155,7 +182,7 @@ assert_installed_shape() {
     ([
       .. | objects |
       select((.command // "") == $other_command)
-    ] | length) == 3 and
+    ] | length) == 4 and
     ([
       .hooks.PreCompact[] |
       select(
@@ -186,6 +213,20 @@ assert_installed_shape() {
             command: $other_command,
             timeout: 9,
             statusMessage: "Keep same-basename sibling"
+          }
+        ]
+      )
+    ] | length) == 1 and
+    ([
+      .hooks.PreToolUse[] |
+      select(
+        .matcher == "exec_command" and
+        .hooks == [
+          {
+            type: "command",
+            command: $other_command,
+            timeout: 3,
+            statusMessage: "Keep unrelated tool hook"
           }
         ]
       )

@@ -85,6 +85,28 @@ class CompactionGuardTests(unittest.TestCase):
         value.update(extra)
         return value
 
+    def pre_tool_use_event(self, **extra):
+        value = self.event(
+            "PreToolUse",
+            permission_mode="bypassPermissions",
+            tool_name="exec_command",
+            tool_input={"command": "git status --short"},
+            tool_use_id="call-0001",
+        )
+        value.update(extra)
+        return value
+
+    def compacted_row(self, message=""):
+        return {
+            "timestamp": "2026-07-12T12:00:03Z",
+            "type": "compacted",
+            "payload": {
+                "message": message,
+                "replacement_history": [],
+                "window_number": 2,
+            },
+        }
+
     def invoke(self, event, *, guard_dir=True, extra_env=None):
         env = {**os.environ}
         if guard_dir:
@@ -471,6 +493,163 @@ class CompactionGuardTests(unittest.TestCase):
         self.assertTrue(all(stderr == "" for _, stderr in results))
         outputs = [json.loads(stdout) for stdout, _ in results]
         self.assertEqual(sum(output.get("decision") == "block" for output in outputs), 1)
+
+    def test_pre_tool_use_delivers_enrichment_early_in_same_turn(self):
+        self.invoke(self.event("PreCompact", trigger="auto"))
+        before_arming = self.invoke(self.pre_tool_use_event())
+        self.assertEqual(before_arming, {"continue": True})
+
+        self.rows.append(self.compacted_row())
+        self._write_rows()
+        self.invoke(self.event("PostCompact", trigger="auto"))
+
+        output = self.invoke(self.pre_tool_use_event())
+        self.assertEqual(set(output.keys()), {"hookSpecificOutput"})
+        specific = output["hookSpecificOutput"]
+        self.assertEqual(set(specific.keys()), {"hookEventName", "additionalContext"})
+        self.assertEqual(specific["hookEventName"], "PreToolUse")
+        context = specific["additionalContext"]
+        self.assertIn("Finish the full proof without narrowing", context)
+        self.assertIn("Mode: recovery", context)
+        self.assertIn("PAST steps", context)
+
+        session_state = self.state / "019f-test--root"
+        self.assertFalse((session_state / "pending.json").exists())
+        consumed = list(session_state.glob("consumed-*.json"))
+        self.assertEqual(len(consumed), 1)
+        self.assertEqual(
+            json.loads(consumed[0].read_text())["consumed_via"], "PreToolUse"
+        )
+
+        stop_after_delivery = self.invoke(
+            self.event(
+                "Stop",
+                permission_mode="bypassPermissions",
+                stop_hook_active=False,
+                last_assistant_message="turn finished after early delivery",
+            )
+        )
+        self.assertNotIn("decision", stop_after_delivery)
+        self.assertEqual(len(list(session_state.glob("consumed-*.json"))), 1)
+
+    def test_pre_tool_use_is_turn_bound(self):
+        self.invoke(self.event("PreCompact", trigger="auto"))
+        self.rows.append(self.compacted_row())
+        self._write_rows()
+        self.invoke(self.event("PostCompact", trigger="auto"))
+
+        other_turn = self.invoke(self.pre_tool_use_event(turn_id="turn-2"))
+        self.assertEqual(other_turn, {"continue": True})
+        pending_path = self.state / "019f-test--root" / "pending.json"
+        self.assertTrue(pending_path.exists())
+
+        same_turn = self.invoke(self.pre_tool_use_event())
+        self.assertEqual(
+            same_turn["hookSpecificOutput"]["hookEventName"], "PreToolUse"
+        )
+        self.assertFalse(pending_path.exists())
+
+    def test_user_prompt_submit_delivers_after_manual_compact(self):
+        self.invoke(self.event("PreCompact", trigger="manual"))
+        self.rows.append(self.compacted_row())
+        self._write_rows()
+        self.invoke(self.event("PostCompact", trigger="manual"))
+
+        output = self.invoke(
+            self.event(
+                "UserPromptSubmit",
+                turn_id="turn-2",
+                permission_mode="bypassPermissions",
+                prompt="continue the task",
+            )
+        )
+        specific = output["hookSpecificOutput"]
+        self.assertEqual(specific["hookEventName"], "UserPromptSubmit")
+        self.assertIn("Finish the full proof", specific["additionalContext"])
+        session_state = self.state / "019f-test--root"
+        self.assertFalse((session_state / "pending.json").exists())
+        consumed = list(session_state.glob("consumed-*.json"))
+        self.assertEqual(len(consumed), 1)
+        self.assertEqual(
+            json.loads(consumed[0].read_text())["consumed_via"], "UserPromptSubmit"
+        )
+
+    def test_concurrent_tool_and_stop_events_inject_exactly_once(self):
+        self.invoke(self.event("PreCompact", trigger="auto"))
+        self.rows.append(self.compacted_row())
+        self._write_rows()
+        self.invoke(self.event("PostCompact", trigger="auto"))
+
+        tool_event = self.pre_tool_use_event()
+        env = {**os.environ, "CODEX_COMPACTION_GUARD_DIR": str(self.state)}
+        processes = [
+            subprocess.Popen(
+                [str(SCRIPT)],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                env=env,
+            )
+            for _ in range(8)
+        ]
+        results = [
+            process.communicate(json.dumps(tool_event), timeout=10)
+            for process in processes
+        ]
+        self.assertTrue(all(stderr == "" for _, stderr in results))
+        outputs = [json.loads(stdout) for stdout, _ in results]
+        injections = sum("hookSpecificOutput" in output for output in outputs)
+        self.assertEqual(injections, 1)
+        session_state = self.state / "019f-test--root"
+        self.assertFalse((session_state / "pending.json").exists())
+        self.assertEqual(len(list(session_state.glob("consumed-*.json"))), 1)
+
+        stop_after_race = self.invoke(
+            self.event(
+                "Stop",
+                permission_mode="bypassPermissions",
+                stop_hook_active=False,
+                last_assistant_message="stopped after compaction",
+            )
+        )
+        self.assertNotIn("decision", stop_after_race)
+        self.assertEqual(len(list(session_state.glob("consumed-*.json"))), 1)
+
+    def test_subagent_pre_tool_use_is_scoped_to_agent_state(self):
+        self.invoke(self.event("PreCompact", trigger="auto"))
+        self.rows.append(self.compacted_row())
+        self._write_rows()
+        self.invoke(self.event("PostCompact", trigger="auto"))
+        root_pending = self.state / "019f-test--root" / "pending.json"
+
+        agent_probe = self.invoke(
+            self.pre_tool_use_event(agent_id="worker-1", agent_type="reviewer")
+        )
+        self.assertEqual(agent_probe, {"continue": True})
+        self.assertTrue(root_pending.exists())
+
+        self.invoke(
+            self.event(
+                "PreCompact", trigger="auto", agent_id="worker-1", agent_type="reviewer"
+            )
+        )
+        self.invoke(
+            self.event(
+                "PostCompact", trigger="auto", agent_id="worker-1", agent_type="reviewer"
+            )
+        )
+        agent_pending = self.state / "019f-test--worker-1" / "pending.json"
+        self.assertTrue(agent_pending.exists())
+
+        output = self.invoke(
+            self.pre_tool_use_event(agent_id="worker-1", agent_type="reviewer")
+        )
+        self.assertEqual(
+            output["hookSpecificOutput"]["hookEventName"], "PreToolUse"
+        )
+        self.assertFalse(agent_pending.exists())
+        self.assertTrue(root_pending.exists())
 
     def test_secrets_are_redacted(self):
         openai_key = "sk-" + "abcdefghijklmnopqrstuvwxyz"

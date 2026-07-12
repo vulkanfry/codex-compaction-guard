@@ -1488,16 +1488,27 @@ fn restore_output(event_name: &str, checkpoint: &Value, pending: &Value) -> Valu
             MAX_RESTORE_CHARS.saturating_sub(char_count(&assessment))
         )
     );
-    if matches!(event_name, "Stop" | "SubagentStop") {
-        json!({"continue": true, "decision": "block", "reason": context})
-    } else {
-        json!({
+    match event_name {
+        "Stop" | "SubagentStop" => {
+            json!({"continue": true, "decision": "block", "reason": context})
+        }
+        // Stable Codex accepts additionalContext from PreToolUse but rejects
+        // outputs that also carry continue:false, stopReason, suppressOutput,
+        // decision, or permission fields, so this surface emits only the
+        // hook-specific payload.
+        "PreToolUse" => json!({
+            "hookSpecificOutput": {
+                "hookEventName": event_name,
+                "additionalContext": context,
+            }
+        }),
+        _ => json!({
             "continue": true,
             "hookSpecificOutput": {
                 "hookEventName": event_name,
                 "additionalContext": context,
             }
-        })
+        }),
     }
 }
 
@@ -1633,12 +1644,22 @@ fn handle_restore_event(event: &Value) -> AnyResult<Value> {
     let event_name = event_string(event, "hook_event_name").unwrap_or_default();
     let mut paths = state_paths(event);
     let mut pending = load_json(&paths.pending);
-    let mut checkpoint = load_json(&paths.checkpoint);
+    // PreToolUse runs on every tool call, so the no-pending fast path must not
+    // pay for parsing a large checkpoint file.
+    let mut checkpoint = if pending.is_some() {
+        load_json(&paths.checkpoint)
+    } else {
+        None
+    };
     let mut used_root_fallback = false;
     if event_name == "SubagentStop" && (pending.is_none() || checkpoint.is_none()) {
         paths = root_state_paths(event);
         pending = load_json(&paths.pending);
-        checkpoint = load_json(&paths.checkpoint);
+        checkpoint = if pending.is_some() {
+            load_json(&paths.checkpoint)
+        } else {
+            None
+        };
         used_root_fallback = true;
     }
     let Some(pending) = pending else {
@@ -1700,6 +1721,11 @@ fn handle_restore_event(event: &Value) -> AnyResult<Value> {
                 return Ok(continue_output());
             }
         }
+        "PreToolUse" => {
+            if !same_optional_value(pending.get("turn_id"), event.get("turn_id")) {
+                return Ok(continue_output());
+            }
+        }
         "SessionStart" => {
             if !matches!(
                 event.get("source").and_then(Value::as_str),
@@ -1725,7 +1751,7 @@ fn dispatch(event: &Value) -> AnyResult<Value> {
     match event.get("hook_event_name").and_then(Value::as_str) {
         Some("PreCompact") => handle_pre_compact(event),
         Some("PostCompact") => handle_post_compact(event),
-        Some("Stop" | "SubagentStop" | "SessionStart" | "UserPromptSubmit") => {
+        Some("PreToolUse" | "Stop" | "SubagentStop" | "SessionStart" | "UserPromptSubmit") => {
             handle_restore_event(event)
         }
         _ => Ok(continue_output()),
