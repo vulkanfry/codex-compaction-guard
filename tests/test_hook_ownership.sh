@@ -7,10 +7,30 @@ trap 'rm -rf "$temporary_codex_home"' EXIT
 
 project_command="$temporary_codex_home/hooks/compaction_guard"
 other_command="/opt/other/compaction_guard"
+fake_bin="$temporary_codex_home/fake-bin"
+fake_codex_log="$temporary_codex_home/fake-codex.log"
 expected_after_uninstall="$temporary_codex_home/expected-after-uninstall.json"
 actual_after_uninstall="$temporary_codex_home/actual-after-uninstall.json"
 
-install -d -m 700 "$temporary_codex_home"
+install -d -m 700 "$temporary_codex_home" "$fake_bin"
+fake_codex="$fake_bin/codex"
+printf '%s\n' \
+  '#!/usr/bin/env bash' \
+  'set -euo pipefail' \
+  'if [[ "$1" == "features" && "$2" == "enable" ]]; then' \
+  '  printf "%s\\n" "$3" >>"$CODEX_FAKE_LOG"' \
+  '  exit 0' \
+  'fi' \
+  'exit 2' >"$fake_codex"
+chmod 755 "$fake_codex"
+
+run_installer() {
+  PATH="$fake_bin:$PATH" \
+    CODEX_FAKE_LOG="$fake_codex_log" \
+    CODEX_HOME="$temporary_codex_home" \
+    "$ROOT/scripts/install.sh"
+}
+
 jq -n \
   --arg project_command "$project_command" \
   --arg other_command "$other_command" '
@@ -180,14 +200,24 @@ assert_installed_shape() {
   ' "$temporary_codex_home/hooks.json" >/dev/null
 }
 
-CODEX_HOME="$temporary_codex_home" "$ROOT/scripts/install.sh"
+run_installer
 assert_installed_shape
+if [[ "$(grep -c '^hooks$' "$fake_codex_log")" -ne 1 ]] ||
+   [[ "$(wc -l <"$fake_codex_log" | tr -d ' ')" -ne 1 ]]; then
+  printf 'feature enable regression failed: installer must enable only hooks\n' >&2
+  exit 1
+fi
 CODEX_COMPACTION_GUARD_EXECUTABLE="$project_command" \
   python3 -m unittest -v "$ROOT/tests/test_hook_lifecycle.py"
 
 # Reinstallation must replace only the exact owned handlers and remain idempotent.
-CODEX_HOME="$temporary_codex_home" "$ROOT/scripts/install.sh"
+run_installer
 assert_installed_shape
+if [[ "$(grep -c '^hooks$' "$fake_codex_log")" -ne 2 ]] ||
+   [[ "$(wc -l <"$fake_codex_log" | tr -d ' ')" -ne 2 ]]; then
+  printf 'feature enable regression failed after reinstall: only hooks is allowed\n' >&2
+  exit 1
+fi
 
 CODEX_HOME="$temporary_codex_home" "$ROOT/scripts/uninstall.sh" --purge-state
 if [[ -e "$project_command" ]]; then

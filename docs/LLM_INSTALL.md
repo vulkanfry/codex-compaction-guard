@@ -58,14 +58,9 @@ Standard installation:
 ./scripts/install.sh
 ```
 
-If the user explicitly requires the current Codex remote compaction v2 feature:
-
-```bash
-./scripts/install.sh --enable-remote-compaction-v2
-```
-
-The installer checks whether the feature exists before enabling it. The guard
-itself does not depend on that private/runtime-discovered feature name.
+Do not modify `remote_compaction_v2` or unrelated Codex feature flags as part
+of guard installation. They are separate user configuration, and the guard
+does not depend on them.
 
 ### 4. Review and trust
 

@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.2 - 2026-07-12
+
+- Remove `remote_compaction_v2` management from the installer; global Codex
+  feature flags remain separate user configuration.
+- Verify that install and reinstall enable only the required `hooks` feature.
+
 ## 0.2.1 - 2026-07-12
 
 - Ignore empty state-directory environment overrides and fall back safely.

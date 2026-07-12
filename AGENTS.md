@@ -32,7 +32,8 @@ cargo test
   enter fresh file context.
 - The 40k restore budget must retain the temporal header, continuation contract,
   and closing XML tag.
-- `remote_compaction_v2` is optional and runtime-discovered.
+- Installation must not manage `remote_compaction_v2` or unrelated Codex
+  feature flags.
 
 ## Editing
 

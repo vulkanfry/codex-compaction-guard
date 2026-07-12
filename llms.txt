@@ -41,7 +41,7 @@ Security constraints:
 Install:
 - ./scripts/verify.sh
 - ./scripts/install.sh
-- optional: ./scripts/install.sh --enable-remote-compaction-v2
+- do not change remote_compaction_v2 or unrelated Codex feature flags
 
 Uninstall:
 - ./scripts/uninstall.sh

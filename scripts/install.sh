@@ -8,11 +8,10 @@ BINARY_PATH="$BINARY_DIR/compaction_guard"
 HOOKS_PATH="$CODEX_HOME/hooks.json"
 STATE_DIR="$CODEX_HOME/compaction-guard"
 BACKUP_DIR="$STATE_DIR/backups"
-ENABLE_REMOTE_COMPACTION_V2=false
 
 usage() {
   printf '%s\n' \
-    "Usage: scripts/install.sh [--enable-remote-compaction-v2]" \
+    "Usage: scripts/install.sh" \
     "" \
     "Builds the release binary, installs it under CODEX_HOME, and merges" \
     "the six guard lifecycle hooks into CODEX_HOME/hooks.json." \
@@ -23,7 +22,6 @@ usage() {
 
 for argument in "$@"; do
   case "$argument" in
-    --enable-remote-compaction-v2) ENABLE_REMOTE_COMPACTION_V2=true ;;
     -h|--help) usage; exit 0 ;;
     *) printf 'Unknown argument: %s\n' "$argument" >&2; usage >&2; exit 2 ;;
   esac
@@ -113,16 +111,6 @@ fi
 if command -v codex >/dev/null 2>&1; then
   if ! CODEX_HOME="$CODEX_HOME" codex features enable hooks >/dev/null; then
     printf 'Warning: could not enable the hooks feature automatically.\n' >&2
-  fi
-  if [[ "$ENABLE_REMOTE_COMPACTION_V2" == true ]]; then
-    if CODEX_HOME="$CODEX_HOME" codex features list | grep -q '^remote_compaction_v2'; then
-      if ! CODEX_HOME="$CODEX_HOME" codex features enable remote_compaction_v2 >/dev/null; then
-        printf 'Warning: could not enable remote_compaction_v2 automatically.\n' >&2
-      fi
-    else
-      printf '%s\n' \
-        'remote_compaction_v2 is not exposed by this Codex build; guard installation succeeded.' >&2
-    fi
   fi
 fi
 

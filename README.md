@@ -77,15 +77,9 @@ The installer:
 Codex intentionally does not trust changed hooks automatically. Open a fresh
 Codex CLI session, run `/hooks`, review all six definitions, and trust them.
 
-The optional current-build flag can be enabled only when the installed Codex
-exposes it:
-
-```bash
-./scripts/install.sh --enable-remote-compaction-v2
-```
-
-`remote_compaction_v2` is treated as a runtime-discovered Codex feature, not as
-a stable public API promised by this project.
+The installer deliberately does not change `remote_compaction_v2` or any other
+unrelated Codex feature. Configure those separately in Codex if desired; the
+guard does not depend on that feature.
 
 ## Verify the installed surface
 
