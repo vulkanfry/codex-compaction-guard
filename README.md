@@ -14,9 +14,11 @@ goal, recent file changes, git state, proof logs, and the next unresolved step.
    `healthy`, then always arms a one-shot continuation.
 3. The first `PreToolUse` of the same turn injects the checkpoint as
    `additionalContext` at the next tool boundary, before the turn ends.
-4. If the turn runs no further tool call, the first `Stop` or `SubagentStop`
+4. A Bash-only `PostToolUse` closes Codex's `write_stdin` gap, where the
+   resumed terminal call intentionally has no `PreToolUse` event.
+5. If the turn runs no further supported tool call, the first `Stop` or `SubagentStop`
    injects the checkpoint and blocks the premature stop once.
-5. `SessionStart` and `UserPromptSubmit` are fallback injection paths when the
+6. `SessionStart` and `UserPromptSubmit` are fallback injection paths when the
    original turn was interrupted.
 
 ### Delivery timing
@@ -29,15 +31,18 @@ supported surface:
 1. `PreToolUse` in the same turn. Auto-compaction usually interrupts a running
    turn that continues with more tool calls, so the enrichment reaches the
    model at the first tool boundary instead of waiting for the turn to end.
-2. `Stop` or `SubagentStop` when the turn ends without another tool call.
-3. `SessionStart` (compact/resume) and `UserPromptSubmit` across turns.
+2. Bash `PostToolUse` when a `write_stdin` poll observes completion of an
+   existing `exec_command`. Stable Codex deliberately skips `PreToolUse` for
+   `write_stdin`, so this closes the post-only completion path.
+3. `Stop` or `SubagentStop` when the turn ends without another supported tool
+   call.
+4. `SessionStart` (compact/resume) and `UserPromptSubmit` across turns.
 
 All delivery surfaces race for the same one-shot pending file, so exactly one
-of them injects. The `PreToolUse` response deliberately contains only
-`hookSpecificOutput.additionalContext`: stable Codex rejects `continue:false`,
-`stopReason`, and `suppressOutput` from `PreToolUse` outputs, and the guard
-must never gate or rewrite the tool call it rides on, so it never emits
-`decision`, `permissionDecision`, or `updatedInput`.
+of them injects. Both tool-boundary responses deliberately contain only
+`hookSpecificOutput.additionalContext`. Stable Codex rejects gating fields on
+`PreToolUse`, and a `PostToolUse` decision cannot undo a completed command, so
+the guard never gates, rewrites, or replaces the tool call it rides on.
 
 Every injected snapshot explicitly tells the model that:
 
@@ -87,11 +92,11 @@ The installer:
 - builds with `cargo build --release --locked`;
 - installs the binary at `~/.codex/hooks/compaction_guard`;
 - backs up the existing `~/.codex/hooks.json`;
-- merges seven guard hook groups without replacing unrelated hooks;
+- merges eight guard hook groups without replacing unrelated hooks;
 - enables the documented `hooks` feature.
 
 Codex intentionally does not trust changed hooks automatically. Open a fresh
-Codex CLI session, run `/hooks`, review all seven definitions, and trust them.
+Codex CLI session, run `/hooks`, review all eight definitions, and trust them.
 
 The installer deliberately does not change `remote_compaction_v2` or any other
 unrelated Codex feature. Configure those separately in Codex if desired; the
@@ -104,12 +109,13 @@ CODEX_COMPACTION_GUARD_EXECUTABLE="$HOME/.codex/hooks/compaction_guard" \
   python3 -m unittest -v tests/test_hook_lifecycle.py
 ```
 
-The lifecycle suite covers 19 scenarios:
+The lifecycle suite covers 20 scenarios:
 
 - empty, weak, and healthy built-in summaries;
 - enrichment versus recovery mode;
 - same-turn `PreToolUse` delivery with a strict schema-safe output shape and
   no later duplicate `Stop` injection;
+- Bash `PostToolUse` delivery for the `write_stdin` post-only fallback;
 - turn binding for the tool-boundary surface;
 - agent-scoped state isolation for subagent tool calls;
 - chronological recent context;
@@ -118,7 +124,8 @@ The lifecycle suite covers 19 scenarios:
 - fallback injection, including `UserPromptSubmit` after a manual compaction;
 - recursive `stop_hook_active` handling;
 - eight concurrent `Stop` processes with exactly one injection;
-- eight concurrent `PreToolUse` processes with exactly one injection;
+- eight concurrent mixed `PreToolUse`/`PostToolUse` processes with exactly one
+  injection;
 - footer preservation at the 40k context budget.
 - private `0700` state directories and `0600` checkpoint files.
 - `CODEX_HOME`-scoped state placement.
@@ -143,8 +150,8 @@ Use [docs/LLM_INSTALL.md](docs/LLM_INSTALL.md), or paste this short request:
 Install this repository as a user-level Codex compaction guard. Read
 docs/LLM_INSTALL.md first. Preserve unrelated hooks, do not bypass or fabricate
 hook trust, run scripts/verify.sh, install the release binary, ask me to review
-the seven hooks through /hooks, then prove one real PreCompact -> PostCompact
--> delivery flow (PreToolUse in the same turn, or Stop/fallback). Report
+the eight hooks through /hooks, then prove one real PreCompact -> PostCompact
+-> delivery flow (PreToolUse, Bash PostToolUse, or Stop/fallback). Report
 registered, trusted, real-action-worked, and not-verified separately.
 ```
 

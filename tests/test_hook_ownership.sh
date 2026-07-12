@@ -86,6 +86,19 @@ jq -n \
           ]
         }
       ],
+      PostToolUse: [
+        {
+          matcher: "Bash",
+          hooks: [
+            {
+              type: "command",
+              command: $other_command,
+              timeout: 4,
+              statusMessage: "Keep unrelated post-tool hook"
+            }
+          ]
+        }
+      ],
       Stop: [
         {
           hooks: [
@@ -147,6 +160,19 @@ jq -n --arg other_command "$other_command" '
           ]
         }
       ],
+      PostToolUse: [
+        {
+          matcher: "Bash",
+          hooks: [
+            {
+              type: "command",
+              command: $other_command,
+              timeout: 4,
+              statusMessage: "Keep unrelated post-tool hook"
+            }
+          ]
+        }
+      ],
       Stop: [
         {
           hooks: [
@@ -168,6 +194,7 @@ assert_installed_shape() {
       "PreCompact",
       "PostCompact",
       "PreToolUse",
+      "PostToolUse",
       "Stop",
       "SubagentStop",
       "SessionStart",
@@ -182,7 +209,7 @@ assert_installed_shape() {
     ([
       .. | objects |
       select((.command // "") == $other_command)
-    ] | length) == 4 and
+    ] | length) == 5 and
     ([
       .hooks.PreCompact[] |
       select(
@@ -227,6 +254,20 @@ assert_installed_shape() {
             command: $other_command,
             timeout: 3,
             statusMessage: "Keep unrelated tool hook"
+          }
+        ]
+      )
+    ] | length) == 1 and
+    ([
+      .hooks.PostToolUse[] |
+      select(
+        .matcher == "Bash" and
+        .hooks == [
+          {
+            type: "command",
+            command: $other_command,
+            timeout: 4,
+            statusMessage: "Keep unrelated post-tool hook"
           }
         ]
       )

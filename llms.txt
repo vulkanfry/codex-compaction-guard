@@ -16,6 +16,7 @@ Hook events:
 - PreCompact
 - PostCompact
 - PreToolUse
+- PostToolUse
 - Stop
 - SubagentStop
 - SessionStart
@@ -23,6 +24,7 @@ Hook events:
 
 Delivery order after PostCompact arms pending state:
 - PreToolUse in the same turn (first tool boundary, additionalContext only)
+- Bash PostToolUse when write_stdin completes an existing exec session
 - Stop or SubagentStop at turn end
 - SessionStart or UserPromptSubmit as cross-turn fallback
 - exactly one surface consumes the one-shot pending file

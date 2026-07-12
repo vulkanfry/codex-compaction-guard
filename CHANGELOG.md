@@ -4,20 +4,21 @@
 
 - Deliver armed enrichment in the same turn through a one-shot `PreToolUse`
   tool-boundary hook bound to session, turn, checkpoint identity, and cwd,
-  with `Stop`, `SubagentStop`, `SessionStart`, and `UserPromptSubmit`
-  unchanged as later fallbacks.
-- Emit only `hookSpecificOutput.additionalContext` from `PreToolUse`; stable
-  Codex rejects gating fields there and the guard never blocks or rewrites the
-  tool call it rides on.
+  plus a Bash-only `PostToolUse` fallback for `write_stdin` completion paths;
+  `Stop`, `SubagentStop`, `SessionStart`, and `UserPromptSubmit` remain later
+  fallbacks.
+- Emit only `hookSpecificOutput.additionalContext` from tool-boundary hooks;
+  the guard never blocks, rewrites, or replaces the tool call it rides on.
 - Skip checkpoint parsing on the per-tool-call fast path until live pending
   state exists.
-- Preserve unrelated `PreToolUse` handlers across install, reinstall, and
-  uninstall, and extend the ownership regression to the seven-event owned
-  surface.
-- Extend the lifecycle suite to 19 scenarios: early same-turn injection with a
+- Preserve unrelated `PreToolUse` and `PostToolUse` handlers across install,
+  reinstall, and uninstall, and extend the ownership regression to the
+  eight-event owned surface.
+- Extend the lifecycle suite to 20 scenarios: early same-turn injection with a
   strict schema-safe output shape, no duplicate `Stop` injection afterwards,
-  turn binding, agent-scoped subagent isolation, an eight-way concurrent
-  `PreToolUse` race, and `UserPromptSubmit` delivery after manual compaction.
+  Bash `PostToolUse` delivery, turn binding, agent-scoped subagent isolation,
+  an eight-way mixed tool-boundary race, and `UserPromptSubmit` delivery after
+  manual compaction.
 
 ## 0.2.2 - 2026-07-12
 

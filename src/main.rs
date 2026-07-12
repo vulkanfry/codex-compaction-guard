@@ -1492,11 +1492,11 @@ fn restore_output(event_name: &str, checkpoint: &Value, pending: &Value) -> Valu
         "Stop" | "SubagentStop" => {
             json!({"continue": true, "decision": "block", "reason": context})
         }
-        // Stable Codex accepts additionalContext from PreToolUse but rejects
-        // outputs that also carry continue:false, stopReason, suppressOutput,
-        // decision, or permission fields, so this surface emits only the
-        // hook-specific payload.
-        "PreToolUse" => json!({
+        // Stable Codex accepts additionalContext at tool boundaries. Keep the
+        // shared Pre/Post response non-gating: PreToolUse rejects several
+        // control fields, and PostToolUse runs after the side effect already
+        // happened, so both emit only the hook-specific payload.
+        "PreToolUse" | "PostToolUse" => json!({
             "hookSpecificOutput": {
                 "hookEventName": event_name,
                 "additionalContext": context,
@@ -1721,7 +1721,7 @@ fn handle_restore_event(event: &Value) -> AnyResult<Value> {
                 return Ok(continue_output());
             }
         }
-        "PreToolUse" => {
+        "PreToolUse" | "PostToolUse" => {
             if !same_optional_value(pending.get("turn_id"), event.get("turn_id")) {
                 return Ok(continue_output());
             }
@@ -1751,9 +1751,10 @@ fn dispatch(event: &Value) -> AnyResult<Value> {
     match event.get("hook_event_name").and_then(Value::as_str) {
         Some("PreCompact") => handle_pre_compact(event),
         Some("PostCompact") => handle_post_compact(event),
-        Some("PreToolUse" | "Stop" | "SubagentStop" | "SessionStart" | "UserPromptSubmit") => {
-            handle_restore_event(event)
-        }
+        Some(
+            "PreToolUse" | "PostToolUse" | "Stop" | "SubagentStop" | "SessionStart"
+            | "UserPromptSubmit",
+        ) => handle_restore_event(event),
         _ => Ok(continue_output()),
     }
 }

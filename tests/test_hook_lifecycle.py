@@ -96,6 +96,18 @@ class CompactionGuardTests(unittest.TestCase):
         value.update(extra)
         return value
 
+    def post_tool_use_event(self, **extra):
+        value = self.event(
+            "PostToolUse",
+            permission_mode="bypassPermissions",
+            tool_name="Bash",
+            tool_input={"command": "git status --short"},
+            tool_response={"output": "clean", "exit_code": 0},
+            tool_use_id="call-0001",
+        )
+        value.update(extra)
+        return value
+
     def compacted_row(self, message=""):
         return {
             "timestamp": "2026-07-12T12:00:03Z",
@@ -521,6 +533,9 @@ class CompactionGuardTests(unittest.TestCase):
             json.loads(consumed[0].read_text())["consumed_via"], "PreToolUse"
         )
 
+        post_after_delivery = self.invoke(self.post_tool_use_event())
+        self.assertNotIn("hookSpecificOutput", post_after_delivery)
+
         stop_after_delivery = self.invoke(
             self.event(
                 "Stop",
@@ -531,6 +546,40 @@ class CompactionGuardTests(unittest.TestCase):
         )
         self.assertNotIn("decision", stop_after_delivery)
         self.assertEqual(len(list(session_state.glob("consumed-*.json"))), 1)
+
+    def test_post_tool_use_delivers_write_stdin_fallback(self):
+        self.invoke(self.event("PreCompact", trigger="auto"))
+        self.rows.append(self.compacted_row())
+        self._write_rows()
+        self.invoke(self.event("PostCompact", trigger="auto"))
+
+        wrong_turn = self.invoke(self.post_tool_use_event(turn_id="turn-2"))
+        self.assertEqual(wrong_turn, {"continue": True})
+        pending_path = self.state / "019f-test--root" / "pending.json"
+        self.assertTrue(pending_path.exists())
+
+        output = self.invoke(self.post_tool_use_event())
+        self.assertEqual(set(output.keys()), {"hookSpecificOutput"})
+        specific = output["hookSpecificOutput"]
+        self.assertEqual(set(specific.keys()), {"hookEventName", "additionalContext"})
+        self.assertEqual(specific["hookEventName"], "PostToolUse")
+        self.assertIn("Finish the full proof without narrowing", specific["additionalContext"])
+        self.assertFalse(pending_path.exists())
+        consumed = list((self.state / "019f-test--root").glob("consumed-*.json"))
+        self.assertEqual(len(consumed), 1)
+        self.assertEqual(
+            json.loads(consumed[0].read_text())["consumed_via"], "PostToolUse"
+        )
+
+        stop_after_delivery = self.invoke(
+            self.event(
+                "Stop",
+                permission_mode="bypassPermissions",
+                stop_hook_active=False,
+                last_assistant_message="turn finished after write_stdin",
+            )
+        )
+        self.assertNotIn("decision", stop_after_delivery)
 
     def test_pre_tool_use_is_turn_bound(self):
         self.invoke(self.event("PreCompact", trigger="auto"))
@@ -574,13 +623,13 @@ class CompactionGuardTests(unittest.TestCase):
             json.loads(consumed[0].read_text())["consumed_via"], "UserPromptSubmit"
         )
 
-    def test_concurrent_tool_and_stop_events_inject_exactly_once(self):
+    def test_concurrent_tool_events_inject_exactly_once_before_stop(self):
         self.invoke(self.event("PreCompact", trigger="auto"))
         self.rows.append(self.compacted_row())
         self._write_rows()
         self.invoke(self.event("PostCompact", trigger="auto"))
 
-        tool_event = self.pre_tool_use_event()
+        events = [self.pre_tool_use_event(), self.post_tool_use_event()] * 4
         env = {**os.environ, "CODEX_COMPACTION_GUARD_DIR": str(self.state)}
         processes = [
             subprocess.Popen(
@@ -591,11 +640,11 @@ class CompactionGuardTests(unittest.TestCase):
                 text=True,
                 env=env,
             )
-            for _ in range(8)
+            for _ in events
         ]
         results = [
-            process.communicate(json.dumps(tool_event), timeout=10)
-            for process in processes
+            process.communicate(json.dumps(event), timeout=10)
+            for process, event in zip(processes, events)
         ]
         self.assertTrue(all(stderr == "" for _, stderr in results))
         outputs = [json.loads(stdout) for stdout, _ in results]

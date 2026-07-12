@@ -17,6 +17,12 @@ PreToolUse (same turn)
   -> atomically rename pending.json to consumed-*.json
   -> return only hookSpecificOutput.additionalContext
 
+PostToolUse (same turn, Bash only)
+  -> cover write_stdin completion paths that have no PreToolUse
+  -> match session, turn, checkpoint identity, and cwd
+  -> atomically rename pending.json to consumed-*.json
+  -> return only hookSpecificOutput.additionalContext
+
 Stop or SubagentStop
   -> reject recursive stop_hook_active
   -> atomically rename pending.json to consumed-*.json
@@ -60,20 +66,23 @@ race for the same one-shot pending file:
    event must match the pending `session_id`, `turn_id`, `checkpoint_id`, and
    normalized `cwd`; any mismatch fails open and preserves the pending state
    for a later surface.
-2. `Stop` and `SubagentStop` deliver when the turn ends without another tool
+2. Bash `PostToolUse` covers `write_stdin`: Codex intentionally skips
+   `PreToolUse` for that transport call but can emit the original command's
+   Bash `PostToolUse` when the process completes.
+3. `Stop` and `SubagentStop` deliver when the turn ends without another tool
    call.
-3. `SessionStart` (compact/resume) and `UserPromptSubmit` deliver across turns
+4. `SessionStart` (compact/resume) and `UserPromptSubmit` deliver across turns
    and resumed sessions without turn binding.
 
-The `PreToolUse` response contains only `hookSpecificOutput.additionalContext`.
-Stable Codex rejects `continue:false`, `stopReason`, and `suppressOutput` from
-`PreToolUse` outputs, and the guard must never gate or rewrite the tool call it
-rides on, so it never emits `decision`, `permissionDecision`, or
-`updatedInput`.
+Tool-boundary responses contain only `hookSpecificOutput.additionalContext`.
+Stable Codex rejects gating fields on `PreToolUse`, and `PostToolUse` runs after
+the side effect, so the guard never emits decisions, permission fields, input
+rewrites, or output replacement fields on either delivery surface.
 
-`PreToolUse` runs before every tool call permanently. Without pending state the
-hook performs one failed `open()` of `pending.json` and exits; the checkpoint
-file is parsed only after live pending state exists.
+`PreToolUse` runs before supported tool calls permanently; Bash `PostToolUse`
+runs after supported shell completions. Without pending state each hook performs
+one failed `open()` of `pending.json` and exits; the checkpoint file is parsed
+only after live pending state exists.
 
 ## One-shot concurrency
 
