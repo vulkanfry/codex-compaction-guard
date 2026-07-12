@@ -1,0 +1,23 @@
+[package]
+name = "codex-compaction-guard"
+version = "0.2.0"
+edition = "2024"
+rust-version = "1.88"
+description = "Native Rust lifecycle hook that preserves and enriches Codex task state across context compaction"
+readme = "README.md"
+keywords = ["codex", "hooks", "compaction", "llm", "rust"]
+categories = ["command-line-utilities", "development-tools"]
+publish = false
+
+[dependencies]
+regex = "1.12.3"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
+time = { version = "0.3.47", features = ["formatting"] }
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+opt-level = 2
+panic = "abort"
+strip = true

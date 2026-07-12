@@ -1,0 +1,54 @@
+# Codex Compaction Guard
+
+Purpose: install a native Rust Codex lifecycle hook that preserves and enriches
+task state across context compaction.
+
+Read first:
+- README.md
+- docs/LLM_INSTALL.md
+- SECURITY.md
+
+Runtime entrypoint:
+- target/release/codex-compaction-guard
+- installed as $CODEX_HOME/hooks/compaction_guard
+
+Hook events:
+- PreCompact
+- PostCompact
+- Stop
+- SubagentStop
+- SessionStart
+- UserPromptSubmit
+
+Required verification:
+1. cargo fmt -- --check
+2. cargo clippy --all-targets -- -D warnings
+3. cargo test
+4. Python lifecycle suite against debug and release binaries
+5. temporary-CODEX_HOME installer/uninstaller smoke
+6. user review and trust through /hooks
+7. one real compaction in a fresh Codex task
+
+Security constraints:
+- Preserve unrelated hooks.
+- Never fabricate trusted_hash values.
+- Do not use --dangerously-bypass-hook-trust as persistent setup.
+- Do not expose checkpoint contents; they may contain private project context.
+- Keep state directories 0700 and files 0600.
+- Do not claim Rust handled a compaction unless its checkpoint has
+  schema_version=2 and checkpoint_id and the audit timestamp matches.
+
+Install:
+- ./scripts/verify.sh
+- ./scripts/install.sh
+- optional: ./scripts/install.sh --enable-remote-compaction-v2
+
+Uninstall:
+- ./scripts/uninstall.sh
+- ./scripts/uninstall.sh --purge-state
+
+Expected final report:
+- registered
+- trusted
+- real action worked
+- not verified

@@ -1,0 +1,80 @@
+{
+  "description": "Native Rust checkpoint guard: preserve Codex state before every compaction and enrich the next continuation.",
+  "hooks": {
+    "PreCompact": [
+      {
+        "matcher": "auto|manual",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "__CODEX_COMPACTION_GUARD_BINARY__",
+            "timeout": 15,
+            "statusMessage": "Saving compaction checkpoint"
+          }
+        ]
+      }
+    ],
+    "PostCompact": [
+      {
+        "matcher": "auto|manual",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "__CODEX_COMPACTION_GUARD_BINARY__",
+            "timeout": 15,
+            "statusMessage": "Checking compacted context"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "__CODEX_COMPACTION_GUARD_BINARY__",
+            "timeout": 15,
+            "statusMessage": "Checking compaction recovery"
+          }
+        ]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "__CODEX_COMPACTION_GUARD_BINARY__",
+            "timeout": 15,
+            "statusMessage": "Checking subagent compaction recovery"
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "matcher": "compact|resume",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "__CODEX_COMPACTION_GUARD_BINARY__",
+            "timeout": 15,
+            "statusMessage": "Restoring compacted task state"
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "__CODEX_COMPACTION_GUARD_BINARY__",
+            "timeout": 15,
+            "statusMessage": "Checking pending compaction recovery"
+          }
+        ]
+      }
+    ]
+  }
+}
