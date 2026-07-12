@@ -27,8 +27,12 @@ Delivery order after PostCompact arms pending state:
   additionalContext only; canonical Bash for nested exec_command)
 - Bash PostToolUse when write_stdin completes an existing exec session
 - Stop or SubagentStop at turn end
-- SessionStart or UserPromptSubmit as cross-turn fallback
-- exactly one surface consumes the one-shot pending file
+- SessionStart or UserPromptSubmit as transcript-backed cross-turn fallback
+- normal events are owned by canonical transcript_path; SubagentStop is owned
+  only by agent_transcript_path and never falls back to root state
+- agent_id is metadata, not a state key
+- null-transcript state is keyed by session+turn and is same-turn-only
+- exactly one surface in each ownership scope consumes the one-shot pending file
 
 Required verification:
 1. cargo fmt -- --check
@@ -46,7 +50,8 @@ Security constraints:
 - Do not expose checkpoint contents; they may contain private project context.
 - Keep state directories 0700 and files 0600.
 - Do not claim Rust handled a compaction unless its checkpoint has
-  schema_version=2 and checkpoint_id and the audit timestamp matches.
+  schema_version=3, checkpoint_id, matching scope_path, and an audit timestamp
+  matching a newly advanced compaction generation.
 
 Install:
 - ./scripts/verify.sh

@@ -2,12 +2,26 @@
 
 ## Unreleased
 
+## 0.3.1 - 2026-07-13
+
 - Clarify that same-turn delivery occurs on the first hook-eligible direct or
   nested tool call: outer code-mode `functions.exec` and `functions.wait` do
   not emit tool-use lifecycle events, while nested `exec_command` is reported
   as canonical `Bash`.
 - Require all eight `/hooks` rows to show `Active = 1` before a live compaction
   proof, and align the lifecycle fixture with Codex's canonical Bash name.
+- Scope root and subagent state by the SHA-256 fingerprint of the canonical
+  transcript path, using `agent_transcript_path` for `SubagentStop` and keeping
+  `agent_id` as optional metadata only.
+- Remove child-to-root pending fallback, isolate null-transcript state to the
+  same turn, and lazily migrate compatible schema-v2 root/agent directories.
+- Reject stale `PostCompact` callbacks unless the transcript shows a newer
+  compaction generation, preferring `window_number` and falling back to RFC3339
+  timestamps; an immutable atomic per-generation claim prevents concurrent or
+  delayed callbacks from rewriting pending state or re-arming after consume.
+- Add concurrent root/child and two-child isolation regressions without
+  `agent_id`, child tool/stop delivery races, canonical symlink alias coverage,
+  and delayed same-turn Post regressions.
 
 ## 0.3.0 - 2026-07-12
 

@@ -282,8 +282,44 @@ assert_installed_shape() {
   ' "$temporary_codex_home/hooks.json" >/dev/null
 }
 
+assert_owned_matchers() {
+  jq -e \
+    --arg project_command "$project_command" '
+    . as $root |
+    [
+      {event: "PreCompact", matcher: "auto|manual"},
+      {event: "PostCompact", matcher: "auto|manual"},
+      {event: "PreToolUse", matcher: null},
+      {event: "PostToolUse", matcher: "^Bash$"},
+      {event: "Stop", matcher: null},
+      {event: "SubagentStop", matcher: null},
+      {event: "SessionStart", matcher: "compact|resume"},
+      {event: "UserPromptSubmit", matcher: null}
+    ] | all(
+      . as $expected |
+      ([
+        $root.hooks[$expected.event][]? |
+        select(any(.hooks[]?; (.command // "") == $project_command)) |
+        (.matcher // null)
+      ] == [$expected.matcher])
+    )
+  ' "$temporary_codex_home/hooks.json" >/dev/null
+}
+
+assert_release_contract() {
+  local expected='codex-compaction-guard 0.3.1 (schema 3)'
+  local actual
+  actual="$($project_command --version)"
+  if [[ "$actual" != "$expected" ]]; then
+    printf 'release contract mismatch: expected %s, got %s\n' "$expected" "$actual" >&2
+    exit 1
+  fi
+}
+
 run_installer
 assert_installed_shape
+assert_owned_matchers
+assert_release_contract
 if [[ "$(grep -c '^hooks$' "$fake_codex_log")" -ne 1 ]] ||
    [[ "$(wc -l <"$fake_codex_log" | tr -d ' ')" -ne 1 ]]; then
   printf 'feature enable regression failed: installer must enable only hooks\n' >&2
@@ -295,6 +331,8 @@ CODEX_COMPACTION_GUARD_EXECUTABLE="$project_command" \
 # Reinstallation must replace only the exact owned handlers and remain idempotent.
 run_installer
 assert_installed_shape
+assert_owned_matchers
+assert_release_contract
 if [[ "$(grep -c '^hooks$' "$fake_codex_log")" -ne 2 ]] ||
    [[ "$(wc -l <"$fake_codex_log" | tr -d ' ')" -ne 2 ]]; then
   printf 'feature enable regression failed after reinstall: only hooks is allowed\n' >&2

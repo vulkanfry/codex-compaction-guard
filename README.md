@@ -10,14 +10,18 @@ goal, recent file changes, git state, proof logs, and the next unresolved step.
 ## What it does
 
 1. `PreCompact` writes an atomic private checkpoint.
-2. `PostCompact` classifies the built-in summary as `empty`, `weak`, or
-   `healthy`, then always arms a one-shot continuation.
+2. `PostCompact` validates the matching checkpoint and, when a transcript is
+   visible, proves that a newer compaction generation exists. It classifies the
+   built-in summary as `empty`, `weak`, or `healthy`, then arms a one-shot
+   continuation.
 3. The first hook-eligible `PreToolUse` of the same turn injects the checkpoint
    as `additionalContext` before that direct or nested tool executes.
 4. A Bash-only `PostToolUse` closes Codex's `write_stdin` gap, where the
    resumed terminal call intentionally has no `PreToolUse` event.
-5. If the turn runs no further supported tool call, the first `Stop` or `SubagentStop`
-   injects the checkpoint and blocks the premature stop once.
+5. If the turn runs no further supported tool call, `Stop` can consume only its
+   own `transcript_path` state, while `SubagentStop` can consume only the child
+   state identified by `agent_transcript_path`. The winner injects once and
+   blocks the premature stop.
 6. `SessionStart` and `UserPromptSubmit` are fallback injection paths when the
    original turn was interrupted.
 
@@ -35,17 +39,20 @@ supported surface:
 2. Bash `PostToolUse` when a `write_stdin` poll observes completion of an
    existing `exec_command`. Stable Codex deliberately skips `PreToolUse` for
    `write_stdin`, so this closes the post-only completion path.
-3. `Stop` or `SubagentStop` when the turn ends without another supported tool
-   call.
-4. `SessionStart` (compact/resume) and `UserPromptSubmit` across turns.
+3. `Stop` for its own transcript, or `SubagentStop` for the child transcript
+   named by `agent_transcript_path`, when the turn ends without another
+   supported tool call.
+4. `SessionStart` (compact/resume) and `UserPromptSubmit` across turns for
+   transcript-backed state.
 
 Codex's outer code-mode `functions.exec` custom call is not itself a lifecycle
 hook boundary. Eligible nested calls, such as `tools.exec_command`, enter the
 normal dispatcher and are reported to hooks under the canonical tool name
 `Bash`. `functions.wait` does not emit either tool-use hook.
 
-All delivery surfaces race for the same one-shot pending file, so exactly one
-of them injects. Both tool-boundary responses deliberately contain only
+All delivery surfaces within a transcript or null-transcript turn scope race
+for the same one-shot pending file, so exactly one of them injects. Both
+tool-boundary responses deliberately contain only
 `hookSpecificOutput.additionalContext`. Stable Codex rejects gating fields on
 `PreToolUse`, and a `PostToolUse` decision cannot undo a completed command, so
 the guard never gates, rewrites, or replaces the tool call it rides on.
@@ -64,10 +71,13 @@ Every injected snapshot explicitly tells the model that:
 - Fails open and emits exactly one JSON line on hook errors.
 - Private state directories use mode `0700`; state files use `0600`.
 - Checkpoints and pending state are written atomically.
+- Each checkpoint/generation is armed by one immutable atomic claim, preventing
+  concurrent or delayed `PostCompact` callbacks from re-arming it.
 - Concurrent delivery hooks, across tool-boundary and stop surfaces, can
   consume a pending enrichment only once.
-- The tool-call fast path stays cheap: without pending state the hook performs
-  a single failed `open()` and never parses the checkpoint.
+- The steady-state no-pending path avoids parsing the current checkpoint. It
+  still resolves canonical transcript ownership and probes compatible legacy
+  state before looking up `pending.json`.
 - Secret patterns and sensitive files are redacted or excluded before state is
   persisted.
 - Git subprocesses have per-command and process-wide deadlines.
@@ -99,7 +109,8 @@ The installer:
 - installs the binary at `~/.codex/hooks/compaction_guard`;
 - backs up the existing `~/.codex/hooks.json`;
 - merges eight guard hook groups without replacing unrelated hooks;
-- enables the documented `hooks` feature.
+- attempts to enable the documented `hooks` feature and warns if Codex rejects
+  that separate feature command.
 
 Codex intentionally does not trust changed hooks automatically. Open a fresh
 Codex CLI session, run `/hooks`, review all eight definitions, and trust them.
@@ -116,7 +127,7 @@ CODEX_COMPACTION_GUARD_EXECUTABLE="$HOME/.codex/hooks/compaction_guard" \
   python3 -m unittest -v tests/test_hook_lifecycle.py
 ```
 
-The lifecycle suite covers 20 scenarios:
+The lifecycle suite covers:
 
 - empty, weak, and healthy built-in summaries;
 - enrichment versus recovery mode;
@@ -124,7 +135,12 @@ The lifecycle suite covers 20 scenarios:
   no later duplicate `Stop` injection;
 - Bash `PostToolUse` delivery for the `write_stdin` post-only fallback;
 - turn binding for the tool-boundary surface;
-- agent-scoped state isolation for subagent tool calls;
+- transcript-scoped root/subagent isolation, including concurrent compactions
+  without `agent_id` and canonical symlink aliases;
+- stale `PostCompact` rejection by compaction generation, including no re-arm
+  during concurrent Post/delivery races or after the same generation has
+  already been consumed;
+- same-turn-only delivery when no transcript path is available;
 - chronological recent context;
 - staged, unstaged, and untracked files;
 - secret redaction and sensitive-file exclusion;
@@ -133,21 +149,31 @@ The lifecycle suite covers 20 scenarios:
 - eight concurrent `Stop` processes with exactly one injection;
 - eight concurrent mixed `PreToolUse`/`PostToolUse` processes with exactly one
   injection;
-- footer preservation at the 40k context budget.
-- private `0700` state directories and `0600` checkpoint files.
-- `CODEX_HOME`-scoped state placement.
-- root-pending fallback for a documented `SubagentStop` payload.
+- footer preservation at the 40k context budget;
+- private `0700` state directories and `0600` checkpoint files;
+- `CODEX_HOME`-scoped state placement;
+- strict `SubagentStop` ownership through `agent_transcript_path`, with no
+  child-to-root pending fallback.
 
 For the strongest proof, trigger one real compaction in a fresh Codex task and
 inspect:
 
 ```text
-~/.codex/compaction-guard/<session-id>--root/checkpoint.json
-~/.codex/compaction-guard/<session-id>--root/audit.jsonl
+~/.codex/compaction-guard/<session-id>--transcript-<32-hex>/checkpoint.json
+~/.codex/compaction-guard/<session-id>--transcript-<32-hex>/audit.jsonl
 ```
 
-A Rust/schema-v2 checkpoint contains `schema_version: 2` and `checkpoint_id`.
-A completed injection adds one `consumed-*.json` record.
+The suffix is the first 32 hexadecimal characters of SHA-256 over the
+canonical transcript path. Events without a transcript path use
+`<session-id>--turn-<turn-id>` and are intentionally ineligible for cross-turn
+fallback delivery. `SubagentStop` resolves ownership from
+`agent_transcript_path`; `agent_id` is metadata, not the state key. Legacy
+schema-v2 root/agent directories are migrated lazily when ownership can be
+proved.
+
+A Rust/schema-v3 checkpoint contains `schema_version: 3`, `checkpoint_id`,
+`scope_key`, and `scope_path`. A completed injection adds one
+`consumed-*.json` record.
 
 ## Give the installation to an LLM
 

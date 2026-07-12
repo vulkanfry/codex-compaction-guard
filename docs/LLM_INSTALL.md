@@ -18,7 +18,7 @@ prove the installed lifecycle with a real action.
 4. Do not make `--dangerously-bypass-hook-trust` part of persistent setup.
 5. Do not print checkpoint bodies or project secrets in the final response.
 6. Do not claim a compaction used Rust based only on the configured command.
-   Match the compaction timestamp to schema-v2 checkpoint and audit evidence.
+   Match the compaction timestamp to schema-v3 checkpoint and audit evidence.
 7. Existing tasks may cache hook discovery. Use a fresh task or restart Codex
    for the final real-action proof.
 
@@ -117,8 +117,10 @@ Use a fresh non-critical Codex task. Add enough context or explicitly request a
 manual compaction. After it completes, inspect only metadata:
 
 ```bash
-state="${CODEX_HOME:-$HOME/.codex}/compaction-guard/<session-id>--root"
-jq '{schema_version, checkpoint_id, created_at, turn_id}' "$state/checkpoint.json"
+state_root="${CODEX_HOME:-$HOME/.codex}/compaction-guard"
+find "$state_root" -maxdepth 1 -type d -name '<session-id>--transcript-*' -print
+state='<matching-directory-selected-by-checkpoint.scope_path>'
+jq '{schema_version, checkpoint_id, created_at, turn_id, scope_key, scope_path, cross_turn_safe, agent_id}' "$state/checkpoint.json"
 tail -n 10 "$state/audit.jsonl"
 find "$state" -maxdepth 1 -name 'consumed-*.json' -print
 ```
@@ -126,14 +128,17 @@ find "$state" -maxdepth 1 -name 'consumed-*.json' -print
 Required evidence:
 
 - checkpoint timestamp matches the new compaction;
-- `schema_version` is `2`;
+- `schema_version` is `3`;
 - `checkpoint_id` is non-empty;
+- `scope_path` matches the root or child transcript that compacted;
 - audit contains `checkpoint_saved` and `restore_armed`;
 - exactly one path consumes the pending snapshot; when the task keeps running
   after compaction the expected consumer is a hook-eligible `PreToolUse` in the
   same turn, Bash `PostToolUse` for a `write_stdin` completion, or otherwise
   `Stop` or a fallback surface;
 - the consumed record's `consumed_via` matches that surface;
+- `SubagentStop` consumes only the directory owned by
+  `agent_transcript_path` and never falls back to root pending state;
 - the injection contains the local-compaction and past-steps semantics;
 - the model continues from an unresolved step instead of asking what to do.
 
@@ -143,6 +148,9 @@ Required evidence:
 - No fresh checkpoint: restart Codex or use a fresh task, then retry.
 - Fresh checkpoint but no consume: inspect whether the task stopped, resumed, or
   received a user prompt; the fallback may still be armed.
+- A `<session>--turn-*` directory has no proven transcript ownership and can
+  deliver only inside the same turn; `SessionStart` and `UserPromptSubmit`
+  intentionally leave it pending.
 - Outer code-mode `functions.exec` rows are not lifecycle boundaries; inspect
   eligible nested tools such as canonical `Bash` before diagnosing a miss.
 - Empty built-in summary: expected mode is `recovery`.

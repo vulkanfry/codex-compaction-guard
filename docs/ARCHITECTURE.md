@@ -4,33 +4,58 @@
 
 ```text
 PreCompact
+  -> resolve canonical transcript ownership (or same-turn fallback scope)
   -> extract deterministic checkpoint
   -> atomic checkpoint.json
 
 PostCompact
   -> inspect latest compacted record
+  -> for transcript-backed state, prove generation advanced beyond the PreCompact baseline
   -> classify empty / weak / healthy
+  -> atomically create one immutable checkpoint+generation claim
+  -> no-op when this checkpoint/generation is already armed
   -> atomic pending.json
 
 PreToolUse (same turn)
-  -> match session, turn, checkpoint identity, and cwd
+  -> match session, transcript scope, turn, checkpoint identity, and cwd
   -> atomically rename pending.json to consumed-*.json
   -> return only hookSpecificOutput.additionalContext
 
 PostToolUse (same turn, Bash only)
   -> cover write_stdin completion paths that have no PreToolUse
-  -> match session, turn, checkpoint identity, and cwd
+  -> match session, transcript scope, turn, checkpoint identity, and cwd
   -> atomically rename pending.json to consumed-*.json
   -> return only hookSpecificOutput.additionalContext
 
-Stop or SubagentStop
+Stop
+  -> resolve state from transcript_path
+  -> reject recursive stop_hook_active
+  -> atomically rename pending.json to consumed-*.json
+  -> return decision=block with local enrichment
+
+SubagentStop
+  -> resolve child state only from agent_transcript_path
+  -> never fall back to root pending state
   -> reject recursive stop_hook_active
   -> atomically rename pending.json to consumed-*.json
   -> return decision=block with local enrichment
 
 SessionStart or UserPromptSubmit
-  -> fallback one-shot additionalContext injection
+  -> fallback one-shot additionalContext injection only for transcript-backed state
 ```
+
+## State ownership
+
+Transcript-backed state lives under
+`<session>--transcript-<32-hex SHA-256 prefix>`, where the digest input is the
+canonical transcript path. Normal events use `transcript_path`;
+`SubagentStop` uses `agent_transcript_path`. `agent_id` remains optional
+metadata and never determines ownership.
+
+When no transcript path exists, state lives under `<session>--turn-<turn>`.
+That scope can deliver only inside the same turn because cross-turn ownership
+cannot be proved. Compatible schema-v2 `<session>--root` and
+`<session>--<agent>` directories are migrated lazily into transcript scope.
 
 ## Checkpoint content
 
@@ -60,19 +85,19 @@ useful even when the model-generated summary is good.
 
 Stable Codex accepts only the common output fields from `PostCompact`, so
 `PostCompact` can arm state but cannot inject context. Delivery surfaces then
-race for the same one-shot pending file:
+race for the same one-shot pending file within one ownership scope:
 
 1. `PreToolUse` delivers at the first hook-eligible direct or nested tool call
    of the same turn. The event must match the pending `session_id`, `turn_id`,
-   `checkpoint_id`, and normalized `cwd`; any mismatch fails open and
+   transcript scope, `checkpoint_id`, and normalized `cwd`; any mismatch fails open and
    preserves the pending state for a later surface.
 2. Bash `PostToolUse` covers `write_stdin`: Codex intentionally skips
    `PreToolUse` for that transport call but can emit the original command's
    Bash `PostToolUse` when the process completes.
-3. `Stop` and `SubagentStop` deliver when the turn ends without another tool
-   call.
+3. `Stop` delivers only for its own transcript. `SubagentStop` delivers only
+   for `agent_transcript_path`; it never consumes root state.
 4. `SessionStart` (compact/resume) and `UserPromptSubmit` deliver across turns
-   and resumed sessions without turn binding.
+   and resumed sessions without turn binding only when `cross_turn_safe=true`.
 
 The outer code-mode `functions.exec` call uses a custom payload and does not
 emit tool-use lifecycle hooks. Nested calls re-enter normal dispatch, so an
@@ -85,9 +110,9 @@ the side effect, so the guard never emits decisions, permission fields, input
 rewrites, or output replacement fields on either delivery surface.
 
 `PreToolUse` runs before supported tool calls permanently; Bash `PostToolUse`
-runs after supported shell completions. Without pending state each hook performs
-one failed `open()` of `pending.json` and exits; the checkpoint file is parsed
-only after live pending state exists.
+runs after supported shell completions. The steady-state no-pending path still
+canonicalizes transcript ownership and probes compatible legacy state, but it
+does not parse the current checkpoint until live pending state exists.
 
 ## One-shot concurrency
 
@@ -96,7 +121,15 @@ atomically rename `pending.json`. Only the process that wins the rename can
 inject. Concurrent losers return `{"continue":true}`.
 
 `checkpoint_id` binds pending state to the exact checkpoint and prevents stale
-pending state from being applied after a newer compaction.
+pending state from being applied after a newer compaction. `PostCompact`
+additionally compares the latest compaction with the checkpoint baseline:
+numeric `window_number` is authoritative when available, with parsed RFC3339
+timestamp as fallback. Equal, older, or unprovable generations do not arm.
+Repeated Post callbacks for the same checkpoint and generation are idempotent.
+An immutable `claimed-generation-*.json` file is acquired with `create_new`
+before pending state is armed, closing the Post/Post/consumer race. The guard
+also checks live `pending.json` and durable `consumed-*.json` records, so a
+delayed callback cannot re-arm a generation after delivery.
 
 ## Time and size budgets
 

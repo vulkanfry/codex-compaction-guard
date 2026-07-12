@@ -31,7 +31,8 @@
 Для нужной сессии должны одновременно существовать:
 
 - свежий `compacted` event;
-- `checkpoint.json` с `schema_version: 2` и непустым `checkpoint_id`;
+- `checkpoint.json` с `schema_version: 3`, непустым `checkpoint_id` и
+  `scope_path`, совпадающим с root- или child-transcript;
 - audit `checkpoint_saved` и `restore_armed` с совпадающим turn/timestamp;
 - после доставки — ровно один новый `consumed-*.json`;
 - модель получила текст про `additional local compaction` и `PAST steps`.
@@ -41,6 +42,11 @@
 `PreToolUse` того же turn (обычный случай для авто-compaction), либо на Bash
 `PostToolUse` после завершения `write_stdin`, либо на `Stop`,
 `SubagentStop`, `SessionStart` или `UserPromptSubmit`.
+
+`Stop` использует только собственный `transcript_path`, а `SubagentStop` —
+только `agent_transcript_path`; child-to-root fallback отсутствует. Если путь
+transcript недоступен, состояние хранится как `<session>--turn-<turn>` и может
+быть доставлено только в том же turn, без `SessionStart`/`UserPromptSubmit`.
 
 Верхнеуровневый code-mode `functions.exec` сам не является lifecycle boundary.
 Его подходящие вложенные вызовы, например `tools.exec_command`, проходят hooks

@@ -1,6 +1,6 @@
 [package]
 name = "codex-compaction-guard"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2024"
 rust-version = "1.88"
 description = "Native Rust lifecycle hook that preserves and enriches Codex task state across context compaction"
@@ -14,7 +14,8 @@ publish = false
 regex = "1.12.3"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
-time = { version = "0.3.47", features = ["formatting"] }
+sha2 = "0.10.9"
+time = { version = "0.3.47", features = ["formatting", "parsing"] }
 
 [profile.release]
 codegen-units = 1

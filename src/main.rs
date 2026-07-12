@@ -1,6 +1,7 @@
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
+use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::env;
 use std::error::Error;
@@ -15,7 +16,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
-const SCHEMA_VERSION: u64 = 2;
+const SCHEMA_VERSION: u64 = 3;
 const MAX_RESTORE_CHARS: usize = 40_000;
 const MAX_TIMELINE_CHARS: usize = 10_000;
 const MAX_FILE_CONTEXT_CHARS: usize = 12_000;
@@ -89,9 +90,18 @@ struct Health {
 
 #[derive(Debug, Clone)]
 struct StatePaths {
+    directory: PathBuf,
     checkpoint: PathBuf,
     pending: PathBuf,
     audit: PathBuf,
+}
+
+#[derive(Debug, Clone)]
+struct ScopeIdentity {
+    session: String,
+    key: String,
+    transcript_path: Option<PathBuf>,
+    cross_turn_safe: bool,
 }
 
 fn now_iso() -> String {
@@ -332,7 +342,67 @@ fn expand_home(raw: &str) -> PathBuf {
     PathBuf::from(raw)
 }
 
-fn state_paths(event: &Value) -> StatePaths {
+fn event_scope_path(event: &Value) -> Option<PathBuf> {
+    let key = if event.get("hook_event_name").and_then(Value::as_str) == Some("SubagentStop") {
+        "agent_transcript_path"
+    } else {
+        "transcript_path"
+    };
+    let raw = event_string(event, key).filter(|value| !value.is_empty())?;
+    let path = expand_home(&raw);
+    let absolute = if path.is_absolute() {
+        path
+    } else {
+        let cwd = event_string(event, "cwd")
+            .map(|value| expand_home(&value))
+            .or_else(|| env::current_dir().ok())
+            .unwrap_or_else(|| PathBuf::from("."));
+        cwd.join(path)
+    };
+    Some(fs::canonicalize(&absolute).unwrap_or(absolute))
+}
+
+fn sha256_prefix(value: &[u8]) -> String {
+    let digest = Sha256::digest(value);
+    digest[..16]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn scope_fingerprint(path: &Path) -> String {
+    sha256_prefix(path.to_string_lossy().as_bytes())
+}
+
+fn scope_identity(event: &Value) -> ScopeIdentity {
+    let session = safe_id(event.get("session_id"));
+    if let Some(transcript_path) = event_scope_path(event) {
+        return ScopeIdentity {
+            session,
+            key: format!("transcript-{}", scope_fingerprint(&transcript_path)),
+            transcript_path: Some(transcript_path),
+            cross_turn_safe: true,
+        };
+    }
+    ScopeIdentity {
+        session,
+        key: format!("turn-{}", safe_id(event.get("turn_id"))),
+        transcript_path: None,
+        cross_turn_safe: false,
+    }
+}
+
+fn state_paths_for_scope(scope: &ScopeIdentity) -> StatePaths {
+    let directory = state_root().join(format!("{}--{}", scope.session, scope.key));
+    StatePaths {
+        directory: directory.clone(),
+        checkpoint: directory.join("checkpoint.json"),
+        pending: directory.join("pending.json"),
+        audit: directory.join("audit.jsonl"),
+    }
+}
+
+fn legacy_state_paths(event: &Value) -> StatePaths {
     let session = safe_id(event.get("session_id"));
     let agent = event
         .get("agent_id")
@@ -342,18 +412,102 @@ fn state_paths(event: &Value) -> StatePaths {
         .unwrap_or_else(|| "root".to_string());
     let directory = state_root().join(format!("{session}--{agent}"));
     StatePaths {
+        directory: directory.clone(),
         checkpoint: directory.join("checkpoint.json"),
         pending: directory.join("pending.json"),
         audit: directory.join("audit.jsonl"),
     }
 }
 
-fn root_state_paths(event: &Value) -> StatePaths {
-    let mut root_event = event.clone();
-    if let Some(object) = root_event.as_object_mut() {
-        object.remove("agent_id");
+fn checkpoint_matches_scope(checkpoint: &Value, event: &Value, scope: &ScopeIdentity) -> bool {
+    if !same_optional_value(checkpoint.get("session_id"), event.get("session_id")) {
+        return false;
     }
-    state_paths(&root_event)
+    if let Some(checkpoint_key) = checkpoint.get("scope_key").and_then(Value::as_str) {
+        if checkpoint_key != scope.key {
+            return false;
+        }
+        return match (
+            checkpoint.get("scope_path").and_then(Value::as_str),
+            scope.transcript_path.as_ref(),
+        ) {
+            (Some(checkpoint_path), Some(scope_path)) => {
+                normalized_path(checkpoint_path)
+                    == normalized_path(scope_path.to_string_lossy().as_ref())
+            }
+            (None, None) => true,
+            _ => false,
+        };
+    }
+    match (
+        checkpoint.get("transcript_path").and_then(Value::as_str),
+        scope.transcript_path.as_ref(),
+    ) {
+        (Some(checkpoint_path), Some(scope_path)) => {
+            normalized_path(checkpoint_path)
+                == normalized_path(scope_path.to_string_lossy().as_ref())
+        }
+        (None, None) => same_optional_value(checkpoint.get("turn_id"), event.get("turn_id")),
+        _ => false,
+    }
+}
+
+fn maybe_migrate_legacy_state(
+    event: &Value,
+    scope: &ScopeIdentity,
+    paths: &StatePaths,
+) -> AnyResult<()> {
+    if paths.checkpoint.is_file() || paths.pending.is_file() {
+        return Ok(());
+    }
+    let legacy = legacy_state_paths(event);
+    if legacy.directory == paths.directory || !legacy.checkpoint.is_file() {
+        return Ok(());
+    }
+    let Some(checkpoint) = load_json(&legacy.checkpoint) else {
+        return Ok(());
+    };
+    if !checkpoint_matches_scope(&checkpoint, event, scope) {
+        return Ok(());
+    }
+    ensure_private_dir(&state_root())?;
+    if paths.directory.exists() {
+        ensure_private_dir(&paths.directory)?;
+        for entry in fs::read_dir(&legacy.directory)? {
+            let entry = entry?;
+            let target = paths.directory.join(entry.file_name());
+            if target.exists() {
+                continue;
+            }
+            match fs::rename(entry.path(), target) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        let _ = fs::remove_dir(&legacy.directory);
+    } else {
+        match fs::rename(&legacy.directory, &paths.directory) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    let _ = append_audit(
+        &paths.audit,
+        "state_migrated",
+        json!({"from": legacy.directory.to_string_lossy(), "scope_key": scope.key}),
+    );
+    Ok(())
+}
+
+fn scoped_state_paths(event: &Value) -> AnyResult<(ScopeIdentity, StatePaths)> {
+    let scope = scope_identity(event);
+    let paths = state_paths_for_scope(&scope);
+    maybe_migrate_legacy_state(event, &scope, &paths)?;
+    Ok((scope, paths))
 }
 
 fn ensure_private_dir(path: &Path) -> AnyResult<()> {
@@ -390,6 +544,33 @@ fn atomic_write_json(path: &Path, value: &Value) -> AnyResult<()> {
         return Err(error.into());
     }
     Ok(())
+}
+
+fn create_json_once(path: &Path, value: &Value) -> AnyResult<bool> {
+    let parent = path.parent().ok_or("state path has no parent")?;
+    ensure_private_dir(parent)?;
+    let mut file = match OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
+    let result = (|| -> AnyResult<()> {
+        let mut serialized = serde_json::to_vec_pretty(value)?;
+        serialized.push(b'\n');
+        file.write_all(&serialized)?;
+        file.sync_all()?;
+        Ok(())
+    })();
+    if let Err(error) = result {
+        let _ = fs::remove_file(path);
+        return Err(error);
+    }
+    Ok(true)
 }
 
 fn append_audit(path: &Path, event: &str, details: Value) -> AnyResult<()> {
@@ -1287,21 +1468,27 @@ fn render_checkpoint(checkpoint: &Value) -> String {
     format!("{header}\n{middle}\n{footer}")
 }
 
-fn build_checkpoint(event: &Value) -> Value {
+fn build_checkpoint(event: &Value, scope: &ScopeIdentity) -> Value {
     let cwd = event_string(event, "cwd")
         .map(|path| expand_home(&path))
         .or_else(|| env::current_dir().ok())
         .unwrap_or_else(|| PathBuf::from("."));
     let transcript_path = event_string(event, "transcript_path");
-    let transcript = extract_transcript_state(transcript_path.as_deref());
+    let canonical_transcript_path = scope
+        .transcript_path
+        .as_ref()
+        .map(|path| path.to_string_lossy().into_owned());
+    let transcript = extract_transcript_state(canonical_transcript_path.as_deref());
     let git = git_snapshot(&cwd);
     let fresh_files = fresh_recent_file_context(&cwd, &transcript, git.as_ref());
     let evidence = project_evidence(&cwd);
     let checkpoint_id = format!(
-        "{}-{}-{}",
+        "{}-{}-{}-{}-{}",
         safe_id(event.get("session_id")),
+        scope.key,
         safe_id(event.get("turn_id")),
-        unix_millis()
+        unix_millis(),
+        std::process::id()
     );
     let mut checkpoint = json!({
         "schema_version": SCHEMA_VERSION,
@@ -1310,6 +1497,9 @@ fn build_checkpoint(event: &Value) -> Value {
         "created_at_unix": unix_seconds(),
         "session_id": event.get("session_id").cloned().unwrap_or(Value::Null),
         "turn_id": event.get("turn_id").cloned().unwrap_or(Value::Null),
+        "scope_key": scope.key,
+        "scope_path": scope.transcript_path.as_ref().map(|path| path.to_string_lossy().to_string()),
+        "cross_turn_safe": scope.cross_turn_safe,
         "agent_id": event.get("agent_id").cloned().unwrap_or(Value::Null),
         "agent_type": event.get("agent_type").cloned().unwrap_or(Value::Null),
         "trigger": event.get("trigger").cloned().unwrap_or(Value::Null),
@@ -1441,6 +1631,145 @@ fn latest_compaction_health(transcript_path: Option<&str>) -> (bool, Health) {
     (needs_recovery, health)
 }
 
+fn compaction_window(value: Option<&Value>) -> Option<u64> {
+    let value = value?;
+    value
+        .as_u64()
+        .or_else(|| value.as_str().and_then(|value| value.parse().ok()))
+}
+
+fn compaction_timestamp(value: Option<&Value>) -> Option<OffsetDateTime> {
+    value
+        .and_then(Value::as_str)
+        .and_then(|value| OffsetDateTime::parse(value, &Rfc3339).ok())
+}
+
+fn checkpoint_compaction(checkpoint: &Value) -> Option<&Value> {
+    checkpoint
+        .get("transcript")?
+        .get("last_compaction")
+        .filter(|value| !value.is_null())
+}
+
+fn compaction_generation_advanced(
+    checkpoint: &Value,
+    health: &Health,
+    transcript_visible: bool,
+) -> bool {
+    if !transcript_visible {
+        return true;
+    }
+    let current_window = compaction_window(health.window_number.as_ref());
+    let current_timestamp = compaction_timestamp(health.timestamp.as_ref());
+    let Some(previous) = checkpoint_compaction(checkpoint) else {
+        return current_window.is_some() || current_timestamp.is_some();
+    };
+    let previous_window = compaction_window(previous.get("window_number"));
+    if let (Some(previous), Some(current)) = (previous_window, current_window) {
+        return current > previous;
+    }
+    match (
+        compaction_timestamp(previous.get("timestamp")),
+        current_timestamp,
+    ) {
+        (Some(previous), Some(current)) => current > previous,
+        _ => false,
+    }
+}
+
+fn same_compaction_generation(left: &Value, right: &Health) -> bool {
+    let left_window = compaction_window(left.get("window_number"));
+    let right_window = compaction_window(right.window_number.as_ref());
+    if let (Some(left), Some(right)) = (left_window, right_window) {
+        return left == right;
+    }
+    match (
+        compaction_timestamp(left.get("timestamp")),
+        compaction_timestamp(right.timestamp.as_ref()),
+    ) {
+        (Some(left), Some(right)) => left == right,
+        (None, None) => true,
+        _ => false,
+    }
+}
+
+fn pending_matches_generation(pending: &Value, checkpoint: &Value, health: &Health) -> bool {
+    same_optional_value(
+        pending.get("checkpoint_id"),
+        checkpoint.get("checkpoint_id"),
+    ) && pending
+        .get("health")
+        .is_some_and(|pending_health| same_compaction_generation(pending_health, health))
+}
+
+fn recorded_generation(
+    paths: &StatePaths,
+    checkpoint: &Value,
+    health: &Health,
+) -> Option<&'static str> {
+    if load_json(&paths.pending)
+        .as_ref()
+        .is_some_and(|pending| pending_matches_generation(pending, checkpoint, health))
+    {
+        return Some("pending");
+    }
+    let entries = fs::read_dir(&paths.directory).ok()?;
+    for entry in entries.flatten() {
+        let file_name = entry.file_name();
+        let Some(file_name) = file_name.to_str() else {
+            continue;
+        };
+        if !file_name.starts_with("consumed-") || !file_name.ends_with(".json") {
+            continue;
+        }
+        if load_json(&entry.path())
+            .as_ref()
+            .is_some_and(|consumed| pending_matches_generation(consumed, checkpoint, health))
+        {
+            return Some("consumed");
+        }
+    }
+    None
+}
+
+fn generation_claim_path(paths: &StatePaths, checkpoint: &Value, health: &Health) -> PathBuf {
+    let checkpoint_id = checkpoint
+        .get("checkpoint_id")
+        .and_then(value_to_string)
+        .unwrap_or_else(|| "unknown-checkpoint".to_string());
+    let generation = if let Some(window) = compaction_window(health.window_number.as_ref()) {
+        format!("window:{window}")
+    } else if let Some(timestamp) = compaction_timestamp(health.timestamp.as_ref()) {
+        format!("timestamp:{}", timestamp.unix_timestamp_nanos())
+    } else {
+        "unknown-generation".to_string()
+    };
+    let fingerprint = sha256_prefix(format!("{checkpoint_id}\n{generation}").as_bytes());
+    paths
+        .directory
+        .join(format!("claimed-generation-{fingerprint}.json"))
+}
+
+fn claim_generation(
+    paths: &StatePaths,
+    checkpoint: &Value,
+    health: &Health,
+) -> AnyResult<Option<PathBuf>> {
+    let claim_path = generation_claim_path(paths, checkpoint, health);
+    let claim = json!({
+        "schema_version": SCHEMA_VERSION,
+        "claimed_at": now_iso(),
+        "checkpoint_id": checkpoint.get("checkpoint_id").cloned().unwrap_or(Value::Null),
+        "window_number": health.window_number.clone(),
+        "timestamp": health.timestamp.clone(),
+    });
+    if create_json_once(&claim_path, &claim)? {
+        Ok(Some(claim_path))
+    } else {
+        Ok(None)
+    }
+}
+
 fn pending_is_live(pending: &Value) -> bool {
     pending
         .get("armed_at_unix")
@@ -1534,8 +1863,8 @@ fn consume_pending(paths: &StatePaths, via: &str, pending: &Value) -> AnyResult<
 }
 
 fn handle_pre_compact(event: &Value) -> AnyResult<Value> {
-    let paths = state_paths(event);
-    let checkpoint = build_checkpoint(event);
+    let (scope, paths) = scoped_state_paths(event)?;
+    let checkpoint = build_checkpoint(event, &scope);
     atomic_write_json(&paths.checkpoint, &checkpoint)?;
     match fs::remove_file(&paths.pending) {
         Ok(()) => {}
@@ -1563,18 +1892,39 @@ fn handle_pre_compact(event: &Value) -> AnyResult<Value> {
 }
 
 fn handle_post_compact(event: &Value) -> AnyResult<Value> {
-    let paths = state_paths(event);
+    let (scope, paths) = scoped_state_paths(event)?;
     let checkpoint = load_json(&paths.checkpoint);
-    let transcript_path = event_string(event, "transcript_path");
+    let transcript_path = scope
+        .transcript_path
+        .as_ref()
+        .map(|path| path.to_string_lossy().into_owned());
     let (needs_recovery, health) = latest_compaction_health(transcript_path.as_deref());
-    if checkpoint.is_none() {
+    let checkpoint_identity_matches = checkpoint.as_ref().is_some_and(|checkpoint| {
+        checkpoint_matches_scope(checkpoint, event, &scope)
+            && same_optional_value(checkpoint.get("turn_id"), event.get("turn_id"))
+            && same_normalized_path_value(checkpoint.get("cwd"), event.get("cwd"))
+    });
+    let generation_advanced = checkpoint.as_ref().is_some_and(|checkpoint| {
+        checkpoint_identity_matches
+            && compaction_generation_advanced(checkpoint, &health, scope.transcript_path.is_some())
+    });
+    if !checkpoint_identity_matches || !generation_advanced {
+        let not_armed_reason = if checkpoint_identity_matches {
+            "compaction_generation_unproven"
+        } else {
+            "checkpoint_identity_mismatch"
+        };
         append_audit(
             &paths.audit,
             "restore_not_armed",
             json!({
                 "turn_id": event.get("turn_id").cloned().unwrap_or(Value::Null),
-                "checkpoint_present": false,
-                "reason": health.reason,
+                "checkpoint_present": checkpoint.is_some(),
+                "checkpoint_identity_match": checkpoint_identity_matches,
+                "compaction_generation_advanced": generation_advanced,
+                "scope_key": scope.key,
+                "reason": not_armed_reason,
+                "health_reason": health.reason,
                 "level": health.level,
                 "message_length": health.message_length,
                 "replacement_length": health.replacement_length,
@@ -1584,6 +1934,34 @@ fn handle_post_compact(event: &Value) -> AnyResult<Value> {
         )?;
         return Ok(continue_output());
     }
+    let checkpoint = checkpoint.as_ref().expect("identity checked above");
+    if let Some(recorded_as) = recorded_generation(&paths, checkpoint, &health) {
+        append_audit(
+            &paths.audit,
+            "restore_already_recorded",
+            json!({
+                "turn_id": event.get("turn_id").cloned().unwrap_or(Value::Null),
+                "checkpoint_id": checkpoint.get("checkpoint_id").cloned().unwrap_or(Value::Null),
+                "recorded_as": recorded_as,
+                "window_number": health.window_number,
+                "timestamp": health.timestamp,
+            }),
+        )?;
+        return Ok(continue_output());
+    }
+    let Some(claim_path) = claim_generation(&paths, checkpoint, &health)? else {
+        append_audit(
+            &paths.audit,
+            "restore_already_claimed",
+            json!({
+                "turn_id": event.get("turn_id").cloned().unwrap_or(Value::Null),
+                "checkpoint_id": checkpoint.get("checkpoint_id").cloned().unwrap_or(Value::Null),
+                "window_number": health.window_number,
+                "timestamp": health.timestamp,
+            }),
+        )?;
+        return Ok(continue_output());
+    };
     let mode = if needs_recovery {
         "recovery"
     } else {
@@ -1595,18 +1973,23 @@ fn handle_post_compact(event: &Value) -> AnyResult<Value> {
         "armed_at_unix": unix_seconds(),
         "session_id": event.get("session_id").cloned().unwrap_or(Value::Null),
         "turn_id": event.get("turn_id").cloned().unwrap_or(Value::Null),
+        "scope_key": scope.key,
+        "scope_path": scope.transcript_path.as_ref().map(|path| path.to_string_lossy().to_string()),
+        "cross_turn_safe": scope.cross_turn_safe,
         "agent_id": event.get("agent_id").cloned().unwrap_or(Value::Null),
         "cwd": event.get("cwd").cloned().unwrap_or(Value::Null),
         "checkpoint_path": paths.checkpoint.to_string_lossy(),
         "checkpoint_id": checkpoint
-            .as_ref()
-            .and_then(|value| value.get("checkpoint_id"))
+            .get("checkpoint_id")
             .cloned()
             .unwrap_or(Value::Null),
         "mode": mode,
         "health": health,
     });
-    atomic_write_json(&paths.pending, &pending)?;
+    if let Err(error) = atomic_write_json(&paths.pending, &pending) {
+        let _ = fs::remove_file(&claim_path);
+        return Err(error);
+    }
     append_audit(
         &paths.audit,
         "restore_armed",
@@ -1629,6 +2012,17 @@ fn normalized_path(value: &str) -> PathBuf {
     fs::canonicalize(&path).unwrap_or(path)
 }
 
+fn same_normalized_path_value(left: Option<&Value>, right: Option<&Value>) -> bool {
+    match (
+        left.and_then(value_to_string),
+        right.and_then(value_to_string),
+    ) {
+        (Some(left), Some(right)) => normalized_path(&left) == normalized_path(&right),
+        (None, None) => true,
+        _ => false,
+    }
+}
+
 fn same_optional_value(left: Option<&Value>, right: Option<&Value>) -> bool {
     match (
         left.and_then(value_to_string),
@@ -1640,28 +2034,27 @@ fn same_optional_value(left: Option<&Value>, right: Option<&Value>) -> bool {
     }
 }
 
+fn compatible_optional_value(left: Option<&Value>, right: Option<&Value>) -> bool {
+    match (
+        left.and_then(value_to_string),
+        right.and_then(value_to_string),
+    ) {
+        (Some(left), Some(right)) => left == right,
+        _ => true,
+    }
+}
+
 fn handle_restore_event(event: &Value) -> AnyResult<Value> {
     let event_name = event_string(event, "hook_event_name").unwrap_or_default();
-    let mut paths = state_paths(event);
-    let mut pending = load_json(&paths.pending);
+    let (scope, paths) = scoped_state_paths(event)?;
+    let pending = load_json(&paths.pending);
     // PreToolUse runs on every tool call, so the no-pending fast path must not
     // pay for parsing a large checkpoint file.
-    let mut checkpoint = if pending.is_some() {
+    let checkpoint = if pending.is_some() {
         load_json(&paths.checkpoint)
     } else {
         None
     };
-    let mut used_root_fallback = false;
-    if event_name == "SubagentStop" && (pending.is_none() || checkpoint.is_none()) {
-        paths = root_state_paths(event);
-        pending = load_json(&paths.pending);
-        checkpoint = if pending.is_some() {
-            load_json(&paths.checkpoint)
-        } else {
-            None
-        };
-        used_root_fallback = true;
-    }
     let Some(pending) = pending else {
         return Ok(continue_output());
     };
@@ -1670,18 +2063,20 @@ fn handle_restore_event(event: &Value) -> AnyResult<Value> {
     };
     if !pending_is_live(&pending)
         || !same_optional_value(pending.get("session_id"), event.get("session_id"))
+        || pending
+            .get("scope_key")
+            .and_then(Value::as_str)
+            .is_some_and(|key| key != scope.key)
+        || !checkpoint_matches_scope(&checkpoint, event, &scope)
         || !same_optional_value(
             pending.get("checkpoint_id"),
             checkpoint.get("checkpoint_id"),
         )
+        || !compatible_optional_value(pending.get("agent_id"), event.get("agent_id"))
     {
         return Ok(continue_output());
     }
-    if let (Some(pending_cwd), Some(event_cwd)) = (
-        pending.get("cwd").and_then(Value::as_str),
-        event.get("cwd").and_then(Value::as_str),
-    ) && normalized_path(pending_cwd) != normalized_path(event_cwd)
-    {
+    if !same_normalized_path_value(pending.get("cwd"), event.get("cwd")) {
         return Ok(continue_output());
     }
 
@@ -1701,23 +2096,8 @@ fn handle_restore_event(event: &Value) -> AnyResult<Value> {
                 .get("stop_hook_active")
                 .and_then(Value::as_bool)
                 .unwrap_or(false)
+                || !same_optional_value(pending.get("turn_id"), event.get("turn_id"))
             {
-                return Ok(continue_output());
-            }
-            if used_root_fallback {
-                let parent_transcript_matches = match (
-                    checkpoint.get("transcript_path").and_then(Value::as_str),
-                    event.get("transcript_path").and_then(Value::as_str),
-                ) {
-                    (Some(checkpoint_path), Some(event_path)) => {
-                        normalized_path(checkpoint_path) == normalized_path(event_path)
-                    }
-                    _ => false,
-                };
-                if !parent_transcript_matches {
-                    return Ok(continue_output());
-                }
-            } else if !same_optional_value(pending.get("turn_id"), event.get("turn_id")) {
                 return Ok(continue_output());
             }
         }
@@ -1730,11 +2110,25 @@ fn handle_restore_event(event: &Value) -> AnyResult<Value> {
             if !matches!(
                 event.get("source").and_then(Value::as_str),
                 Some("compact" | "resume")
-            ) {
+            ) || !scope.cross_turn_safe
+                || !pending
+                    .get("cross_turn_safe")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(scope.transcript_path.is_some())
+            {
                 return Ok(continue_output());
             }
         }
-        "UserPromptSubmit" => {}
+        "UserPromptSubmit" => {
+            if !scope.cross_turn_safe
+                || !pending
+                    .get("cross_turn_safe")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(scope.transcript_path.is_some())
+            {
+                return Ok(continue_output());
+            }
+        }
         _ => return Ok(continue_output()),
     }
 
@@ -1794,7 +2188,7 @@ fn main() {
     match dispatch(&event) {
         Ok(output) => emit(&output),
         Err(error) => {
-            let paths = state_paths(&event);
+            let paths = state_paths_for_scope(&scope_identity(&event));
             let _ = append_audit(
                 &paths.audit,
                 "hook_error",
@@ -1838,5 +2232,49 @@ mod tests {
         let text = "данные".repeat(2_000);
         assert!(char_count(&truncate(&text, 400, false)) <= 400);
         assert!(char_count(&truncate_middle(&text, 400)) <= 400);
+    }
+
+    #[test]
+    fn compaction_generation_prefers_window_number_over_timestamp() {
+        let checkpoint = json!({
+            "transcript": {
+                "last_compaction": {
+                    "window_number": 4,
+                    "timestamp": "2026-07-12T12:00:00Z"
+                }
+            }
+        });
+        let health = Health {
+            window_number: Some(json!(4)),
+            timestamp: Some(json!("2026-07-12T12:01:00Z")),
+            ..Health::default()
+        };
+        assert!(!compaction_generation_advanced(&checkpoint, &health, true));
+    }
+
+    #[test]
+    fn generation_claim_is_atomic() {
+        let directory = env::temp_dir().join(format!(
+            "codex-compaction-guard-claim-{}-{}",
+            std::process::id(),
+            unix_millis()
+        ));
+        ensure_private_dir(&directory).unwrap();
+        let claim_path = directory.join("claim.json");
+        let claim = json!({"checkpoint_id": "checkpoint", "window_number": 7});
+        let handles = (0..16)
+            .map(|_| {
+                let claim_path = claim_path.clone();
+                let claim = claim.clone();
+                thread::spawn(move || create_json_once(&claim_path, &claim).unwrap())
+            })
+            .collect::<Vec<_>>();
+        let winners = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .filter(|won| *won)
+            .count();
+        assert_eq!(winners, 1);
+        let _ = fs::remove_dir_all(directory);
     }
 }
