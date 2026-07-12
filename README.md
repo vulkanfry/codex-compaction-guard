@@ -184,5 +184,4 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) and
 
 ## License
 
-No open-source license has been selected yet. Add one before public
-redistribution.
+[MIT](LICENSE)

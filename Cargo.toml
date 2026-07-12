@@ -5,6 +5,7 @@ edition = "2024"
 rust-version = "1.88"
 description = "Native Rust lifecycle hook that preserves and enriches Codex task state across context compaction"
 readme = "README.md"
+license = "MIT"
 keywords = ["codex", "hooks", "compaction", "llm", "rust"]
 categories = ["command-line-utilities", "development-tools"]
 publish = false
