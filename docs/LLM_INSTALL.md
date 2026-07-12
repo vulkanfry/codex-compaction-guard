@@ -100,6 +100,10 @@ hooks:
 - command points to the native binary
 - no discovery warnings or errors
 
+In the CLI table, every installed guard event must show `Active = 1`. Treat
+any nonzero `Review` count as a failed prerequisite; newly installed tool hooks
+will otherwise be skipped even while older hooks continue to run.
+
 ### 6. Installed binary test
 
 ```bash
@@ -126,9 +130,9 @@ Required evidence:
 - `checkpoint_id` is non-empty;
 - audit contains `checkpoint_saved` and `restore_armed`;
 - exactly one path consumes the pending snapshot; when the task keeps running
-  after compaction the expected consumer is `PreToolUse` in the same turn,
-  Bash `PostToolUse` for a `write_stdin` completion, or otherwise `Stop` or a
-  fallback surface;
+  after compaction the expected consumer is a hook-eligible `PreToolUse` in the
+  same turn, Bash `PostToolUse` for a `write_stdin` completion, or otherwise
+  `Stop` or a fallback surface;
 - the consumed record's `consumed_via` matches that surface;
 - the injection contains the local-compaction and past-steps semantics;
 - the model continues from an unresolved step instead of asking what to do.
@@ -139,6 +143,8 @@ Required evidence:
 - No fresh checkpoint: restart Codex or use a fresh task, then retry.
 - Fresh checkpoint but no consume: inspect whether the task stopped, resumed, or
   received a user prompt; the fallback may still be armed.
+- Outer code-mode `functions.exec` rows are not lifecycle boundaries; inspect
+  eligible nested tools such as canonical `Bash` before diagnosing a miss.
 - Empty built-in summary: expected mode is `recovery`.
 - Healthy built-in summary: expected mode is `enrichment`.
 - Hook timeout: inspect the private audit file; the hook must still fail open.

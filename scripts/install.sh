@@ -122,4 +122,5 @@ printf '%s\n' \
   "" \
   "Security step: open /hooks in a fresh Codex CLI session, review all eight" \
   "definitions, and trust them. Codex intentionally skips changed hooks until" \
-  "their current definitions are reviewed."
+  "their current definitions are reviewed. Continue only when every guard row" \
+  "shows Active = 1 and the Review count is zero."

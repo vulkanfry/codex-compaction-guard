@@ -12,7 +12,8 @@
 5. Не меняй `remote_compaction_v2` и другие посторонние feature-флаги Codex:
    это отдельная пользовательская конфигурация.
 6. Открой новую Codex-сессию и попроси пользователя проверить и доверить восемь
-   определений через `/hooks`.
+   определений через `/hooks`; у всех восьми должно быть `Active = 1`, а
+   `Review` должен быть равен нулю.
 7. Проверь установленный бинарник lifecycle-тестами.
 8. Выполни одну реальную compaction в новой тестовой задаче и сопоставь её
    timestamp с checkpoint/audit.
@@ -36,10 +37,14 @@
 - модель получила текст про `additional local compaction` и `PAST steps`.
 
 Если `pending.json` ещё существует, Rust `PreCompact/PostCompact` уже сработали,
-но инъекция пока не была потреблена. Она произойдёт на первом подходящем
-`PreToolUse` того же turn (обычный случай для авто-compaction), либо на
-Bash `PostToolUse` после завершения `write_stdin`, либо на `Stop`,
+но инъекция пока не была потреблена. Она произойдёт на первом hook-eligible
+`PreToolUse` того же turn (обычный случай для авто-compaction), либо на Bash
+`PostToolUse` после завершения `write_stdin`, либо на `Stop`,
 `SubagentStop`, `SessionStart` или `UserPromptSubmit`.
+
+Верхнеуровневый code-mode `functions.exec` сам не является lifecycle boundary.
+Его подходящие вложенные вызовы, например `tools.exec_command`, проходят hooks
+под каноническим именем `Bash`; `functions.wait` не вызывает tool-use hooks.
 
 ## Финальный отчёт
 

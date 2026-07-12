@@ -89,7 +89,7 @@ class CompactionGuardTests(unittest.TestCase):
         value = self.event(
             "PreToolUse",
             permission_mode="bypassPermissions",
-            tool_name="exec_command",
+            tool_name="Bash",
             tool_input={"command": "git status --short"},
             tool_use_id="call-0001",
         )
@@ -506,7 +506,7 @@ class CompactionGuardTests(unittest.TestCase):
         outputs = [json.loads(stdout) for stdout, _ in results]
         self.assertEqual(sum(output.get("decision") == "block" for output in outputs), 1)
 
-    def test_pre_tool_use_delivers_enrichment_early_in_same_turn(self):
+    def test_received_pre_tool_use_delivers_enrichment_early_in_same_turn(self):
         self.invoke(self.event("PreCompact", trigger="auto"))
         before_arming = self.invoke(self.pre_tool_use_event())
         self.assertEqual(before_arming, {"continue": True})

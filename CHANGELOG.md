@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+- Clarify that same-turn delivery occurs on the first hook-eligible direct or
+  nested tool call: outer code-mode `functions.exec` and `functions.wait` do
+  not emit tool-use lifecycle events, while nested `exec_command` is reported
+  as canonical `Bash`.
+- Require all eight `/hooks` rows to show `Active = 1` before a live compaction
+  proof, and align the lifecycle fixture with Codex's canonical Bash name.
+
 ## 0.3.0 - 2026-07-12
 
 - Deliver armed enrichment in the same turn through a one-shot `PreToolUse`

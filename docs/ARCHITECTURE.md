@@ -62,10 +62,10 @@ Stable Codex accepts only the common output fields from `PostCompact`, so
 `PostCompact` can arm state but cannot inject context. Delivery surfaces then
 race for the same one-shot pending file:
 
-1. `PreToolUse` delivers at the first tool boundary of the same turn. The
-   event must match the pending `session_id`, `turn_id`, `checkpoint_id`, and
-   normalized `cwd`; any mismatch fails open and preserves the pending state
-   for a later surface.
+1. `PreToolUse` delivers at the first hook-eligible direct or nested tool call
+   of the same turn. The event must match the pending `session_id`, `turn_id`,
+   `checkpoint_id`, and normalized `cwd`; any mismatch fails open and
+   preserves the pending state for a later surface.
 2. Bash `PostToolUse` covers `write_stdin`: Codex intentionally skips
    `PreToolUse` for that transport call but can emit the original command's
    Bash `PostToolUse` when the process completes.
@@ -73,6 +73,11 @@ race for the same one-shot pending file:
    call.
 4. `SessionStart` (compact/resume) and `UserPromptSubmit` deliver across turns
    and resumed sessions without turn binding.
+
+The outer code-mode `functions.exec` call uses a custom payload and does not
+emit tool-use lifecycle hooks. Nested calls re-enter normal dispatch, so an
+eligible `tools.exec_command` emits `PreToolUse` with canonical tool name
+`Bash`; `functions.wait` emits neither tool-use event.
 
 Tool-boundary responses contain only `hookSpecificOutput.additionalContext`.
 Stable Codex rejects gating fields on `PreToolUse`, and `PostToolUse` runs after

@@ -23,7 +23,8 @@ Hook events:
 - UserPromptSubmit
 
 Delivery order after PostCompact arms pending state:
-- PreToolUse in the same turn (first tool boundary, additionalContext only)
+- PreToolUse in the same turn (first hook-eligible direct or nested tool call,
+  additionalContext only; canonical Bash for nested exec_command)
 - Bash PostToolUse when write_stdin completes an existing exec session
 - Stop or SubagentStop at turn end
 - SessionStart or UserPromptSubmit as cross-turn fallback

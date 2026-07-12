@@ -12,8 +12,8 @@ goal, recent file changes, git state, proof logs, and the next unresolved step.
 1. `PreCompact` writes an atomic private checkpoint.
 2. `PostCompact` classifies the built-in summary as `empty`, `weak`, or
    `healthy`, then always arms a one-shot continuation.
-3. The first `PreToolUse` of the same turn injects the checkpoint as
-   `additionalContext` at the next tool boundary, before the turn ends.
+3. The first hook-eligible `PreToolUse` of the same turn injects the checkpoint
+   as `additionalContext` before that direct or nested tool executes.
 4. A Bash-only `PostToolUse` closes Codex's `write_stdin` gap, where the
    resumed terminal call intentionally has no `PreToolUse` event.
 5. If the turn runs no further supported tool call, the first `Stop` or `SubagentStop`
@@ -30,13 +30,19 @@ supported surface:
 
 1. `PreToolUse` in the same turn. Auto-compaction usually interrupts a running
    turn that continues with more tool calls, so the enrichment reaches the
-   model at the first tool boundary instead of waiting for the turn to end.
+   model at the first hook-eligible direct or nested tool call instead of
+   waiting for the turn to end.
 2. Bash `PostToolUse` when a `write_stdin` poll observes completion of an
    existing `exec_command`. Stable Codex deliberately skips `PreToolUse` for
    `write_stdin`, so this closes the post-only completion path.
 3. `Stop` or `SubagentStop` when the turn ends without another supported tool
    call.
 4. `SessionStart` (compact/resume) and `UserPromptSubmit` across turns.
+
+Codex's outer code-mode `functions.exec` custom call is not itself a lifecycle
+hook boundary. Eligible nested calls, such as `tools.exec_command`, enter the
+normal dispatcher and are reported to hooks under the canonical tool name
+`Bash`. `functions.wait` does not emit either tool-use hook.
 
 All delivery surfaces race for the same one-shot pending file, so exactly one
 of them injects. Both tool-boundary responses deliberately contain only
@@ -97,6 +103,7 @@ The installer:
 
 Codex intentionally does not trust changed hooks automatically. Open a fresh
 Codex CLI session, run `/hooks`, review all eight definitions, and trust them.
+Do not start the real-compaction proof until all eight rows show `Active = 1`.
 
 The installer deliberately does not change `remote_compaction_v2` or any other
 unrelated Codex feature. Configure those separately in Codex if desired; the
