@@ -302,10 +302,14 @@ fn event_string(event: &Value, key: &str) -> Option<String> {
 }
 
 fn state_root() -> PathBuf {
-    if let Ok(configured) = env::var("CODEX_COMPACTION_GUARD_DIR") {
+    if let Ok(configured) = env::var("CODEX_COMPACTION_GUARD_DIR")
+        && !configured.is_empty()
+    {
         return expand_home(&configured);
     }
-    if let Ok(codex_home) = env::var("CODEX_HOME") {
+    if let Ok(codex_home) = env::var("CODEX_HOME")
+        && !codex_home.is_empty()
+    {
         return expand_home(&codex_home).join("compaction-guard");
     }
     let home = env::var_os("HOME")
@@ -1630,10 +1634,12 @@ fn handle_restore_event(event: &Value) -> AnyResult<Value> {
     let mut paths = state_paths(event);
     let mut pending = load_json(&paths.pending);
     let mut checkpoint = load_json(&paths.checkpoint);
+    let mut used_root_fallback = false;
     if event_name == "SubagentStop" && (pending.is_none() || checkpoint.is_none()) {
         paths = root_state_paths(event);
         pending = load_json(&paths.pending);
         checkpoint = load_json(&paths.checkpoint);
+        used_root_fallback = true;
     }
     let Some(pending) = pending else {
         return Ok(continue_output());
@@ -1659,13 +1665,38 @@ fn handle_restore_event(event: &Value) -> AnyResult<Value> {
     }
 
     match event_name.as_str() {
-        "Stop" | "SubagentStop" => {
+        "Stop" => {
             if event
                 .get("stop_hook_active")
                 .and_then(Value::as_bool)
                 .unwrap_or(false)
                 || !same_optional_value(pending.get("turn_id"), event.get("turn_id"))
             {
+                return Ok(continue_output());
+            }
+        }
+        "SubagentStop" => {
+            if event
+                .get("stop_hook_active")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
+                return Ok(continue_output());
+            }
+            if used_root_fallback {
+                let parent_transcript_matches = match (
+                    checkpoint.get("transcript_path").and_then(Value::as_str),
+                    event.get("transcript_path").and_then(Value::as_str),
+                ) {
+                    (Some(checkpoint_path), Some(event_path)) => {
+                        normalized_path(checkpoint_path) == normalized_path(event_path)
+                    }
+                    _ => false,
+                };
+                if !parent_transcript_matches {
+                    return Ok(continue_output());
+                }
+            } else if !same_optional_value(pending.get("turn_id"), event.get("turn_id")) {
                 return Ok(continue_output());
             }
         }

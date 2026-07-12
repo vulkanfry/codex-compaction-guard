@@ -89,6 +89,8 @@ class CompactionGuardTests(unittest.TestCase):
         env = {**os.environ}
         if guard_dir:
             env["CODEX_COMPACTION_GUARD_DIR"] = str(self.state)
+        else:
+            env.pop("CODEX_COMPACTION_GUARD_DIR", None)
         if extra_env:
             env.update(extra_env)
         completed = subprocess.run(
@@ -273,19 +275,53 @@ class CompactionGuardTests(unittest.TestCase):
 
     def test_codex_home_controls_default_state_location(self):
         codex_home = self.root / "custom-codex-home"
+        fallback_home = self.root / "fallback-home"
+        hook_env = {
+            "CODEX_HOME": str(codex_home),
+            "HOME": str(fallback_home),
+        }
         self.invoke(
             self.event("PreCompact", trigger="auto"),
             guard_dir=False,
-            extra_env={"CODEX_HOME": str(codex_home)},
+            extra_env=hook_env,
         )
-        checkpoint = (
-            codex_home
-            / "compaction-guard"
-            / "019f-test--root"
-            / "checkpoint.json"
+        self.rows.append(
+            {
+                "timestamp": "2026-07-12T12:00:03Z",
+                "type": "compacted",
+                "payload": {"message": "", "replacement_history": [], "window_number": 2},
+            }
         )
+        self._write_rows()
+        self.invoke(
+            self.event("PostCompact", trigger="auto"),
+            guard_dir=False,
+            extra_env=hook_env,
+        )
+
+        session_state = codex_home / "compaction-guard" / "019f-test--root"
+        checkpoint = session_state / "checkpoint.json"
+        pending = session_state / "pending.json"
+        audit = session_state / "audit.jsonl"
         self.assertTrue(checkpoint.is_file())
+        self.assertTrue(pending.is_file())
+        self.assertTrue(audit.is_file())
         self.assertEqual((codex_home / "compaction-guard").stat().st_mode & 0o777, 0o700)
+        self.assertFalse((fallback_home / ".codex" / "compaction-guard").exists())
+
+        output = self.invoke(
+            self.event(
+                "Stop",
+                permission_mode="bypassPermissions",
+                stop_hook_active=False,
+                last_assistant_message="stopped after compaction",
+            ),
+            guard_dir=False,
+            extra_env=hook_env,
+        )
+        self.assertEqual(output["decision"], "block")
+        self.assertFalse(pending.exists())
+        self.assertEqual(len(list(session_state.glob("consumed-*.json"))), 1)
 
     def test_staged_and_untracked_files_are_included(self):
         (self.repo / "staged.txt").write_text("staged content\n", encoding="utf-8")
@@ -329,7 +365,7 @@ class CompactionGuardTests(unittest.TestCase):
         self.assertEqual(first_real_stop["decision"], "block")
 
     def test_subagent_stop_falls_back_to_root_pending(self):
-        self.invoke(self.event("PreCompact", trigger="auto"))
+        self.invoke(self.event("PreCompact", turn_id="root-turn", trigger="auto"))
         self.rows.append(
             {
                 "timestamp": "2026-07-12T12:00:03Z",
@@ -338,20 +374,43 @@ class CompactionGuardTests(unittest.TestCase):
             }
         )
         self._write_rows()
-        self.invoke(self.event("PostCompact", trigger="auto"))
+        self.invoke(self.event("PostCompact", turn_id="root-turn", trigger="auto"))
 
-        output = self.invoke(
-            self.event(
-                "SubagentStop",
-                agent_id="worker-1",
-                agent_type="reviewer",
-                permission_mode="bypassPermissions",
-                stop_hook_active=False,
-                last_assistant_message="subagent stopped",
-            )
+        agent_transcript = self.root / "agent-rollout.jsonl"
+        agent_transcript.write_text("", encoding="utf-8")
+        subagent_event = self.event(
+            "SubagentStop",
+            turn_id="child-turn",
+            agent_id="worker-1",
+            agent_type="reviewer",
+            agent_transcript_path=str(agent_transcript),
+            permission_mode="bypassPermissions",
+            stop_hook_active=False,
+            last_assistant_message="subagent stopped",
         )
+
+        wrong_parent = self.invoke(
+            {
+                **subagent_event,
+                "transcript_path": str(agent_transcript),
+            }
+        )
+        self.assertNotIn("decision", wrong_parent)
+        pending = self.state / "019f-test--root" / "pending.json"
+        self.assertTrue(pending.exists())
+
+        output = self.invoke(subagent_event)
         self.assertEqual(output["decision"], "block")
-        self.assertFalse((self.state / "019f-test--root" / "pending.json").exists())
+        self.assertFalse(pending.exists())
+        consumed = list((self.state / "019f-test--root").glob("consumed-*.json"))
+        self.assertEqual(len(consumed), 1)
+
+        second = self.invoke(subagent_event)
+        self.assertNotIn("decision", second)
+        self.assertEqual(
+            len(list((self.state / "019f-test--root").glob("consumed-*.json"))),
+            1,
+        )
 
     def test_session_start_is_fallback_injection(self):
         self.invoke(self.event("PreCompact", trigger="manual"))

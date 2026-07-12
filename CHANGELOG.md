@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.2.1 - 2026-07-12
+
+- Ignore empty state-directory environment overrides and fall back safely.
+- Prove the complete custom `CODEX_HOME` compaction lifecycle.
+- Accept real child `turn_id` values when `SubagentStop` safely consumes a
+  root compaction, bound to the parent transcript and checkpoint identity.
+- Add exact hook-ownership regression coverage for install, reinstall, and
+  uninstall while preserving unrelated handlers and matcher groups.
+
 ## 0.2.0 - 2026-07-12
 
 - Reimplemented the compaction guard as a native Rust binary.
