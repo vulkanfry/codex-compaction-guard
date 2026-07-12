@@ -81,7 +81,9 @@ Every injected snapshot explicitly tells the model that:
 - Secret patterns and sensitive files are redacted or excluded before state is
   persisted.
 - Git subprocesses have per-command and process-wide deadlines.
-- Restore context is bounded to 40,000 Unicode characters while retaining the
+- The private checkpoint context is bounded to 40,000 Unicode characters.
+  Model-visible delivery is capped separately at 8,000 characters for healthy
+  enrichment and 16,000 for recovery, while retaining the assessment,
   temporal header, continuation contract, and closing tag.
 
 ## Requirements
@@ -149,7 +151,9 @@ The lifecycle suite covers:
 - eight concurrent `Stop` processes with exactly one injection;
 - eight concurrent mixed `PreToolUse`/`PostToolUse` processes with exactly one
   injection;
-- footer preservation at the 40k context budget;
+- footer preservation at the 40k private checkpoint budget;
+- oversized healthy/recovery delivery caps at 8k/16k, including preserved
+  assessment and temporal/continuation framing plus exact audit accounting;
 - private `0700` state directories and `0600` checkpoint files;
 - `CODEX_HOME`-scoped state placement;
 - strict `SubagentStop` ownership through `agent_transcript_path`, with no
@@ -173,7 +177,9 @@ proved.
 
 A Rust/schema-v3 checkpoint contains `schema_version: 3`, `checkpoint_id`,
 `scope_key`, and `scope_path`. A completed injection adds one
-`consumed-*.json` record.
+`consumed-*.json` record with `injected_chars` and
+`injection_budget_chars`; the matching `restore_consumed` audit row records
+the same delivery accounting.
 
 ## Give the installation to an LLM
 

@@ -35,6 +35,10 @@
   `scope_path`, совпадающим с root- или child-transcript;
 - audit `checkpoint_saved` и `restore_armed` с совпадающим turn/timestamp;
 - после доставки — ровно один новый `consumed-*.json`;
+- в `consumed-*.json` и audit `restore_consumed` совпадают `injected_chars` и
+  `injection_budget_chars`;
+- `enrichment` не превышает 8 000 символов, а `recovery` — 16 000, даже если
+  приватный checkpoint достиг локального лимита 40 000;
 - модель получила текст про `additional local compaction` и `PAST steps`.
 
 Если `pending.json` ещё существует, Rust `PreCompact/PostCompact` уже сработали,

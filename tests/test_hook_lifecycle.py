@@ -182,6 +182,31 @@ class CompactionGuardTests(unittest.TestCase):
     def pending(self):
         return json.loads((self.transcript_state() / "pending.json").read_text())
 
+    def inflate_checkpoint_context(self):
+        self.rows[0]["payload"]["goal"]["objective"] = "goal-detail " * 5_000
+        self.rows.extend(
+            {
+                "timestamp": f"2026-07-12T12:01:{index:02d}Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "output_text",
+                            "text": f"progress-{index} " + "x" * 2_350,
+                        }
+                    ],
+                },
+            }
+            for index in range(20)
+        )
+        (self.repo / ".codex" / "proof-ledger.jsonl").parent.mkdir()
+        (self.repo / ".codex" / "proof-ledger.jsonl").write_text(
+            "proof " * 5_000, encoding="utf-8"
+        )
+        self._write_rows()
+
     def test_checkpoint_schema_and_scope_metadata(self):
         self.invoke(self.event("PreCompact", trigger="auto"))
         checkpoint = self.checkpoint()
@@ -276,6 +301,137 @@ class CompactionGuardTests(unittest.TestCase):
             )
         )
         self.assertNotIn("decision", second)
+
+    def test_oversized_healthy_enrichment_uses_small_model_visible_budget(self):
+        self.inflate_checkpoint_context()
+        self.invoke(self.event("PreCompact", trigger="auto"))
+        checkpoint_context = self.checkpoint()["restore_context"]
+        self.assertGreater(len(checkpoint_context), 16_000)
+
+        healthy_summary = (
+            "Objective: finish the full proof without narrowing. "
+            "Completed: inspected the initial slots and preserved the current worktree. "
+            "Active: trace slot 36 to its source and verify the remaining economics coverage. "
+            "Next move: inspect the live files and continue from the first unresolved check. "
+        ) * 5
+        self.rows.append(
+            self.compacted_row(
+                healthy_summary,
+                timestamp="2026-07-12T12:02:00Z",
+            )
+        )
+        self._write_rows()
+        self.invoke(self.event("PostCompact", trigger="auto"))
+
+        output = self.invoke(self.pre_tool_use_event())
+        context = output["hookSpecificOutput"]["additionalContext"]
+        self.assertLessEqual(len(context), 8_000)
+        self.assertGreater(len(context), 7_000)
+        self.assertIn("<codex_compaction_assessment>", context)
+        self.assertIn("</codex_compaction_assessment>", context)
+        self.assertIn("Mode: enrichment", context)
+        self.assertIn("## Temporal semantics", context)
+        self.assertIn("Checkpoint created at", context)
+        self.assertIn("## Continuation contract", context)
+        self.assertTrue(context.endswith("</codex_local_compaction_enrichment>"))
+
+        state = self.transcript_state()
+        consumed = json.loads(next(state.glob("consumed-*.json")).read_text())
+        self.assertEqual(consumed["injected_chars"], len(context))
+        self.assertEqual(consumed["injection_budget_chars"], 8_000)
+        audit = [
+            json.loads(line)
+            for line in (state / "audit.jsonl").read_text().splitlines()
+            if json.loads(line)["event"] == "restore_consumed"
+        ][-1]
+        self.assertEqual(audit["mode"], "enrichment")
+        self.assertEqual(audit["injected_chars"], len(context))
+        self.assertEqual(audit["injection_budget_chars"], 8_000)
+
+    def test_oversized_recovery_uses_larger_bounded_model_visible_budget(self):
+        self.inflate_checkpoint_context()
+        self.invoke(self.event("PreCompact", trigger="auto"))
+        checkpoint_context = self.checkpoint()["restore_context"]
+        self.assertGreater(len(checkpoint_context), 16_000)
+
+        self.rows.append(
+            self.compacted_row("", timestamp="2026-07-12T12:02:00Z")
+        )
+        self._write_rows()
+        self.invoke(self.event("PostCompact", trigger="auto"))
+
+        output = self.invoke(self.pre_tool_use_event())
+        context = output["hookSpecificOutput"]["additionalContext"]
+        self.assertLessEqual(len(context), 16_000)
+        self.assertGreater(len(context), 15_000)
+        self.assertIn("<codex_compaction_assessment>", context)
+        self.assertIn("</codex_compaction_assessment>", context)
+        self.assertIn("Mode: recovery", context)
+        self.assertIn("## Temporal semantics", context)
+        self.assertIn("Checkpoint created at", context)
+        self.assertIn("## Continuation contract", context)
+        self.assertTrue(context.endswith("</codex_local_compaction_enrichment>"))
+
+        state = self.transcript_state()
+        consumed = json.loads(next(state.glob("consumed-*.json")).read_text())
+        self.assertEqual(consumed["injected_chars"], len(context))
+        self.assertEqual(consumed["injection_budget_chars"], 16_000)
+        audit = [
+            json.loads(line)
+            for line in (state / "audit.jsonl").read_text().splitlines()
+            if json.loads(line)["event"] == "restore_consumed"
+        ][-1]
+        self.assertEqual(audit["mode"], "recovery")
+        self.assertEqual(audit["injected_chars"], len(context))
+        self.assertEqual(audit["injection_budget_chars"], 16_000)
+
+    def test_malformed_pending_metadata_cannot_expand_assessment_or_audit_mode(self):
+        self.inflate_checkpoint_context()
+        self.invoke(self.event("PreCompact", trigger="auto"))
+        healthy_summary = (
+            "Objective and completed work remain intact after compaction. "
+            "Continue from the first unresolved verification step using live files. "
+        ) * 10
+        self.rows.append(
+            self.compacted_row(
+                healthy_summary,
+                timestamp="2026-07-12T12:02:00Z",
+            )
+        )
+        self._write_rows()
+        self.invoke(self.event("PostCompact", trigger="auto"))
+
+        pending_path = self.transcript_state() / "pending.json"
+        pending = json.loads(pending_path.read_text())
+        pending["mode"] = "unexpected-mode-" + "m" * 20_000
+        pending["health"]["level"] = "unexpected-level-" + "l" * 20_000
+        pending["health"]["message_length"] = "not-a-number-" + "s" * 20_000
+        pending["health"]["window_number"] = "not-a-number-" + "w" * 20_000
+        pending_path.write_text(json.dumps(pending), encoding="utf-8")
+
+        output = self.invoke(self.pre_tool_use_event())
+        context = output["hookSpecificOutput"]["additionalContext"]
+        self.assertLessEqual(len(context), 8_000)
+        self.assertIn("Mode: enrichment", context)
+        self.assertIn("Built-in summary health: unknown", context)
+        self.assertIn("summary_chars=unknown", context)
+        self.assertIn("window=unknown", context)
+        self.assertIn("</codex_compaction_assessment>", context)
+        self.assertTrue(context.endswith("</codex_local_compaction_enrichment>"))
+
+        state = self.transcript_state()
+        consumed = json.loads(next(state.glob("consumed-*.json")).read_text())
+        self.assertEqual(consumed["mode"], "enrichment")
+        self.assertEqual(consumed["injected_chars"], len(context))
+        self.assertEqual(consumed["injection_budget_chars"], 8_000)
+        audit = [
+            json.loads(line)
+            for line in (state / "audit.jsonl").read_text().splitlines()
+            if json.loads(line)["event"] == "restore_consumed"
+        ][-1]
+        self.assertEqual(audit["mode"], "enrichment")
+        self.assertEqual(audit["injected_chars"], len(context))
+        self.assertEqual(audit["injection_budget_chars"], 8_000)
 
     def test_weak_compaction_is_classified_as_recovery(self):
         self.invoke(self.event("PreCompact", trigger="auto"))
@@ -1285,22 +1441,7 @@ class CompactionGuardTests(unittest.TestCase):
         self.assertIn("[REDACTED", restore)
 
     def test_restore_footer_survives_budget_truncation(self):
-        self.rows[0]["payload"]["goal"]["objective"] = "goal-detail " * 5_000
-        self.rows.extend(
-            {
-                "timestamp": f"2026-07-12T12:01:{index:02d}Z",
-                "type": "response_item",
-                "payload": {
-                    "type": "message",
-                    "role": "assistant",
-                    "content": [{"type": "output_text", "text": f"progress-{index} " + "x" * 2_350}],
-                },
-            }
-            for index in range(20)
-        )
-        (self.repo / ".codex" / "proof-ledger.jsonl").parent.mkdir()
-        (self.repo / ".codex" / "proof-ledger.jsonl").write_text("proof " * 5_000, encoding="utf-8")
-        self._write_rows()
+        self.inflate_checkpoint_context()
         self.invoke(self.event("PreCompact", trigger="auto"))
         restore = self.checkpoint()["restore_context"]
         self.assertLessEqual(len(restore), 40_000)

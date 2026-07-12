@@ -137,6 +137,10 @@ Required evidence:
   same turn, Bash `PostToolUse` for a `write_stdin` completion, or otherwise
   `Stop` or a fallback surface;
 - the consumed record's `consumed_via` matches that surface;
+- the consumed record and `restore_consumed` audit row agree on
+  `injected_chars` and `injection_budget_chars`;
+- healthy `enrichment` delivers no more than 8,000 characters; `recovery`
+  delivers no more than 16,000, even when the private checkpoint is 40,000;
 - `SubagentStop` consumes only the directory owned by
   `agent_transcript_path` and never falls back to root pending state;
 - the injection contains the local-compaction and past-steps semantics;
@@ -155,6 +159,8 @@ Required evidence:
   eligible nested tools such as canonical `Bash` before diagnosing a miss.
 - Empty built-in summary: expected mode is `recovery`.
 - Healthy built-in summary: expected mode is `enrichment`.
+- A 40k checkpoint is not a 40k model injection: inspect `restore_consumed` for
+  the mode-specific 8k/16k delivery budget and actual injected size.
 - Hook timeout: inspect the private audit file; the hook must still fail open.
 
 ## Required final report

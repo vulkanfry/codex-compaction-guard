@@ -17,7 +17,9 @@ use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
 const SCHEMA_VERSION: u64 = 3;
-const MAX_RESTORE_CHARS: usize = 40_000;
+const MAX_CHECKPOINT_CONTEXT_CHARS: usize = 40_000;
+const MAX_ENRICHMENT_INJECTION_CHARS: usize = 8_000;
+const MAX_RECOVERY_INJECTION_CHARS: usize = 16_000;
 const MAX_TIMELINE_CHARS: usize = 10_000;
 const MAX_FILE_CONTEXT_CHARS: usize = 12_000;
 const PENDING_TTL_SECONDS: f64 = 6.0 * 60.0 * 60.0;
@@ -1463,7 +1465,7 @@ fn render_checkpoint(checkpoint: &Value) -> String {
     ]
     .join("\n");
     let fixed_chars = char_count(&header) + char_count(&footer) + 2;
-    let middle_budget = MAX_RESTORE_CHARS.saturating_sub(fixed_chars);
+    let middle_budget = MAX_CHECKPOINT_CONTEXT_CHARS.saturating_sub(fixed_chars);
     let middle = truncate_middle(&middle, middle_budget);
     format!("{header}\n{middle}\n{footer}")
 }
@@ -1777,23 +1779,43 @@ fn pending_is_live(pending: &Value) -> bool {
         .is_some_and(|armed| unix_seconds() - armed <= PENDING_TTL_SECONDS)
 }
 
-fn restore_output(event_name: &str, checkpoint: &Value, pending: &Value) -> Value {
+fn injection_budget(mode: &str) -> usize {
+    if mode == "recovery" {
+        MAX_RECOVERY_INJECTION_CHARS
+    } else {
+        MAX_ENRICHMENT_INJECTION_CHARS
+    }
+}
+
+fn restore_mode(pending: &Value) -> &'static str {
+    if pending.get("mode").and_then(Value::as_str) == Some("recovery") {
+        "recovery"
+    } else {
+        "enrichment"
+    }
+}
+
+fn restore_output(
+    event_name: &str,
+    checkpoint: &Value,
+    pending: &Value,
+) -> (Value, usize, usize, &'static str) {
     let Some(context) = checkpoint
         .get("restore_context")
         .and_then(Value::as_str)
         .filter(|context| !context.trim().is_empty())
     else {
-        return continue_output();
+        return (continue_output(), 0, 0, restore_mode(pending));
     };
     let health = pending.get("health").cloned().unwrap_or(Value::Null);
-    let level = health
-        .get("level")
-        .and_then(Value::as_str)
-        .unwrap_or("unknown");
-    let mode = pending
-        .get("mode")
-        .and_then(Value::as_str)
-        .unwrap_or("enrichment");
+    let level = match health.get("level").and_then(Value::as_str) {
+        Some("empty") => "empty",
+        Some("weak") => "weak",
+        Some("healthy") => "healthy",
+        _ => "unknown",
+    };
+    let mode = restore_mode(pending);
+    let injection_budget_chars = injection_budget(mode);
     let interpretation = if mode == "recovery" {
         "The built-in compaction was empty, weak, or unavailable. Use the local snapshot as the recovery anchor, then verify all live state before continuing."
     } else {
@@ -1803,21 +1825,22 @@ fn restore_output(event_name: &str, checkpoint: &Value, pending: &Value) -> Valu
         "<codex_compaction_assessment>\nMode: {mode}. Built-in summary health: {level}; summary_chars={}; window={}. {interpretation}\n</codex_compaction_assessment>\n\n",
         health
             .get("message_length")
-            .and_then(value_to_string)
+            .and_then(Value::as_u64)
+            .map(|value| value.to_string())
             .unwrap_or_else(|| "unknown".to_string()),
-        health
-            .get("window_number")
-            .and_then(value_to_string)
+        compaction_window(health.get("window_number"))
+            .map(|value| value.to_string())
             .unwrap_or_else(|| "unknown".to_string())
     );
     let context = format!(
         "{assessment}{}",
         truncate_middle(
             context,
-            MAX_RESTORE_CHARS.saturating_sub(char_count(&assessment))
+            injection_budget_chars.saturating_sub(char_count(&assessment))
         )
     );
-    match event_name {
+    let injected_chars = char_count(&context);
+    let output = match event_name {
         "Stop" | "SubagentStop" => {
             json!({"continue": true, "decision": "block", "reason": context})
         }
@@ -1838,10 +1861,18 @@ fn restore_output(event_name: &str, checkpoint: &Value, pending: &Value) -> Valu
                 "additionalContext": context,
             }
         }),
-    }
+    };
+    (output, injected_chars, injection_budget_chars, mode)
 }
 
-fn consume_pending(paths: &StatePaths, via: &str, pending: &Value) -> AnyResult<bool> {
+fn consume_pending(
+    paths: &StatePaths,
+    via: &str,
+    pending: &Value,
+    mode: &str,
+    injected_chars: usize,
+    injection_budget_chars: usize,
+) -> AnyResult<bool> {
     let consumed_path = paths
         .pending
         .with_file_name(format!("consumed-{}.json", unix_millis()));
@@ -1853,11 +1884,20 @@ fn consume_pending(paths: &StatePaths, via: &str, pending: &Value) -> AnyResult<
     let mut consumed = pending.clone();
     consumed["consumed_at"] = Value::String(now_iso());
     consumed["consumed_via"] = Value::String(via.to_string());
+    consumed["mode"] = Value::String(mode.to_string());
+    consumed["injected_chars"] = json!(injected_chars);
+    consumed["injection_budget_chars"] = json!(injection_budget_chars);
     let _ = atomic_write_json(&consumed_path, &consumed);
     let _ = append_audit(
         &paths.audit,
         "restore_consumed",
-        json!({"via": via, "turn_id": pending.get("turn_id").cloned().unwrap_or(Value::Null)}),
+        json!({
+            "via": via,
+            "turn_id": pending.get("turn_id").cloned().unwrap_or(Value::Null),
+            "mode": mode,
+            "injected_chars": injected_chars,
+            "injection_budget_chars": injection_budget_chars,
+        }),
     );
     Ok(true)
 }
@@ -2132,10 +2172,20 @@ fn handle_restore_event(event: &Value) -> AnyResult<Value> {
         _ => return Ok(continue_output()),
     }
 
-    let output = restore_output(&event_name, &checkpoint, &pending);
+    let (output, injected_chars, injection_budget_chars, mode) =
+        restore_output(&event_name, &checkpoint, &pending);
     let should_inject = output.get("decision").and_then(Value::as_str) == Some("block")
         || output.get("hookSpecificOutput").is_some();
-    if should_inject && !consume_pending(&paths, &event_name, &pending)? {
+    if should_inject
+        && !consume_pending(
+            &paths,
+            &event_name,
+            &pending,
+            mode,
+            injected_chars,
+            injection_budget_chars,
+        )?
+    {
         return Ok(continue_output());
     }
     Ok(output)

@@ -35,8 +35,10 @@ cargo test
 - Any persisted model-visible or transcript-derived string must be redacted.
 - Sensitive files, binary files, and files outside the repository root must not
   enter fresh file context.
-- The 40k restore budget must retain the temporal header, continuation contract,
-  and closing XML tag.
+- The 40k private checkpoint budget must retain the temporal header,
+  continuation contract, and closing XML tag.
+- Model-visible delivery must remain at or below 8k for healthy enrichment and
+  16k for recovery, preserving the assessment and temporal/continuation frame.
 - Installation must not manage `remote_compaction_v2` or unrelated Codex
   feature flags.
 

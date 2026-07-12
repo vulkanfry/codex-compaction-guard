@@ -33,6 +33,8 @@ Delivery order after PostCompact arms pending state:
 - agent_id is metadata, not a state key
 - null-transcript state is keyed by session+turn and is same-turn-only
 - exactly one surface in each ownership scope consumes the one-shot pending file
+- private checkpoint context may reach 40k characters, but model-visible
+  delivery is capped at 8k for healthy enrichment and 16k for recovery
 
 Required verification:
 1. cargo fmt -- --check
@@ -52,6 +54,8 @@ Security constraints:
 - Do not claim Rust handled a compaction unless its checkpoint has
   schema_version=3, checkpoint_id, matching scope_path, and an audit timestamp
   matching a newly advanced compaction generation.
+- Confirm restore_consumed records actual injected_chars and the selected
+  injection_budget_chars (8000 enrichment or 16000 recovery).
 
 Install:
 - ./scripts/verify.sh

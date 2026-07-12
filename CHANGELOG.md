@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+## 0.3.2 - 2026-07-13
+
+- Keep the private local checkpoint budget at 40,000 Unicode characters, but
+  cap model-visible delivery separately: 8,000 characters for healthy-summary
+  enrichment and 16,000 for empty, weak, or unavailable-summary recovery.
+- Preserve the compaction assessment, temporal semantics, continuation
+  contract, and closing tag when either delivery budget truncates an oversized
+  checkpoint; malformed pending health metadata is normalized before it can
+  affect assessment size or audit mode.
+- Record the selected `injection_budget_chars` and actual `injected_chars` in
+  both the durable consumed record and `restore_consumed` audit event.
+- Add oversized healthy and recovery regressions that prevent a full 40k local
+  checkpoint from being injected on top of Codex's built-in compacted summary.
+
 ## 0.3.1 - 2026-07-13
 
 - Clarify that same-turn delivery occurs on the first hook-eligible direct or

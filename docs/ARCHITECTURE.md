@@ -81,6 +81,11 @@ root. Sensitive names, binary files, and files above 2 MiB are excluded.
 Both modes inject local state because deterministic operational detail can be
 useful even when the model-generated summary is good.
 
+The private checkpoint may retain up to 40k characters. Delivery is a smaller
+view over that checkpoint: healthy `enrichment` is capped at 8k characters,
+while `recovery` is capped at 16k. The renderer keeps the assessment, temporal
+header, continuation contract, and closing tag at either cap.
+
 ## Same-turn delivery order
 
 Stable Codex accepts only the common output fields from `PostCompact`, so
@@ -139,10 +144,14 @@ delayed callback cannot re-arm a generation after delivery.
 - Transcript scan: the most recent 16 MiB, with periodic deadline checks.
 - Recent timeline budget: 10k characters.
 - Fresh file context budget: 12k characters.
-- Final restore context: 40k characters.
+- Private checkpoint context: 40k characters.
+- Model-visible healthy enrichment: 8k characters.
+- Model-visible recovery context: 16k characters.
 
-The final renderer reserves space for the temporal header and continuation
-footer before truncating the middle.
+The checkpoint renderer reserves space for the temporal header and
+continuation footer before truncating the middle. Delivery applies its own
+mode-specific middle truncation and records both `injection_budget_chars` and
+actual `injected_chars` after the one-shot consumer wins.
 
 ## Compatibility boundary
 

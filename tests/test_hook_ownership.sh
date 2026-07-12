@@ -307,7 +307,7 @@ assert_owned_matchers() {
 }
 
 assert_release_contract() {
-  local expected='codex-compaction-guard 0.3.1 (schema 3)'
+  local expected='codex-compaction-guard 0.3.2 (schema 3)'
   local actual
   actual="$($project_command --version)"
   if [[ "$actual" != "$expected" ]]; then
