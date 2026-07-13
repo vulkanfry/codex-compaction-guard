@@ -4,6 +4,8 @@
 
 ```text
 PreCompact
+  -> classify root versus subagent from agent_id or first session_meta
+  -> subagent: no checkpoint and no pending state
   -> resolve canonical transcript ownership (or same-turn fallback scope)
   -> extract deterministic checkpoint
   -> atomic checkpoint.json
@@ -13,8 +15,9 @@ PostCompact
   -> for transcript-backed state, prove generation advanced beyond the PreCompact baseline
   -> classify empty / weak / healthy
   -> atomically create one immutable checkpoint+generation claim
+  -> healthy: audit suppression and use only the built-in summary
+  -> recovery: atomic pending.json
   -> no-op when this checkpoint/generation is already armed
-  -> atomic pending.json
 
 PreToolUse (same turn)
   -> match session, transcript scope, turn, checkpoint identity, and cwd
@@ -31,14 +34,13 @@ Stop
   -> resolve state from transcript_path
   -> reject recursive stop_hook_active
   -> atomically rename pending.json to consumed-*.json
-  -> return decision=block with local enrichment
+  -> return decision=block with local recovery
 
 SubagentStop
   -> resolve child state only from agent_transcript_path
   -> never fall back to root pending state
-  -> reject recursive stop_hook_active
-  -> atomically rename pending.json to consumed-*.json
-  -> return decision=block with local enrichment
+  -> never inject model-visible local context
+  -> atomically suppress pending state left by older guard versions
 
 SessionStart or UserPromptSubmit
   -> fallback one-shot additionalContext injection only for transcript-backed state
@@ -46,11 +48,13 @@ SessionStart or UserPromptSubmit
 
 ## State ownership
 
-Transcript-backed state lives under
+Root transcript-backed state lives under
 `<session>--transcript-<32-hex SHA-256 prefix>`, where the digest input is the
-canonical transcript path. Normal events use `transcript_path`;
-`SubagentStop` uses `agent_transcript_path`. `agent_id` remains optional
-metadata and never determines ownership.
+canonical transcript path. Normal root events use `transcript_path`.
+Subagents are detected first from `agent_id`, then from the first
+`session_meta.payload.source.subagent` or `thread_source=subagent` marker.
+They do not create local checkpoints. `SubagentStop` uses
+`agent_transcript_path` only to find and suppress legacy child pending state.
 
 When no transcript path exists, state lives under `<session>--turn-<turn>`.
 That scope can deliver only inside the same turn because cross-turn ownership
@@ -72,25 +76,25 @@ The extractor streams the JSONL transcript and keeps bounded state:
 No model is called. Live files are read only from within the resolved repository
 root. Sensitive names, binary files, and files above 2 MiB are excluded.
 
-## Recovery modes
+## Recovery policy
 
 - `recovery`: built-in summary is missing, short, or contains reset-like text.
-- `enrichment`: built-in summary is healthy and remains authoritative for newer
-  or conflicting facts.
+- healthy: the built-in summary remains authoritative and no model-visible
+  local context is added.
+- subagent: all local checkpoint and delivery paths are bypassed. Codex clones
+  parent model context into new children, so even correctly scoped child
+  enrichment would duplicate parent history and amplify context growth.
 
-Both modes inject local state because deterministic operational detail can be
-useful even when the model-generated summary is good.
-
-The private checkpoint may retain up to 40k characters. Delivery is a smaller
-view over that checkpoint: healthy `enrichment` is capped at 8k characters,
-while `recovery` is capped at 16k. The renderer keeps the assessment, temporal
-header, continuation contract, and closing tag at either cap.
+The private root checkpoint may retain up to 40k characters. Recovery delivery
+is capped at 16k. The renderer keeps the assessment, temporal header,
+continuation contract, and closing tag. It also states that a copied recovery
+block is inherited parent history, not a spawned agent's active task.
 
 ## Same-turn delivery order
 
 Stable Codex accepts only the common output fields from `PostCompact`, so
-`PostCompact` can arm state but cannot inject context. Delivery surfaces then
-race for the same one-shot pending file within one ownership scope:
+`PostCompact` can arm root recovery but cannot inject context. Delivery
+surfaces then race for the same one-shot pending file:
 
 1. `PreToolUse` delivers at the first hook-eligible direct or nested tool call
    of the same turn. The event must match the pending `session_id`, `turn_id`,
@@ -99,8 +103,8 @@ race for the same one-shot pending file within one ownership scope:
 2. Bash `PostToolUse` covers `write_stdin`: Codex intentionally skips
    `PreToolUse` for that transport call but can emit the original command's
    Bash `PostToolUse` when the process completes.
-3. `Stop` delivers only for its own transcript. `SubagentStop` delivers only
-   for `agent_transcript_path`; it never consumes root state.
+3. Root `Stop` delivers only for its own transcript. `SubagentStop` never
+   delivers and never consumes root state.
 4. `SessionStart` (compact/resume) and `UserPromptSubmit` deliver across turns
    and resumed sessions without turn binding only when `cross_turn_safe=true`.
 
@@ -123,7 +127,9 @@ does not parse the current checkpoint until live pending state exists.
 
 Consumers do not write a consumed copy and then delete pending state. They first
 atomically rename `pending.json`. Only the process that wins the rename can
-inject. Concurrent losers return `{"continue":true}`.
+inject. Concurrent losers return `{"continue":true}`. A legacy healthy or
+subagent pending file is instead atomically renamed to `suppressed-*.json` and
+never becomes model-visible.
 
 `checkpoint_id` binds pending state to the exact checkpoint and prevents stale
 pending state from being applied after a newer compaction. `PostCompact`
@@ -145,13 +151,12 @@ delayed callback cannot re-arm a generation after delivery.
 - Recent timeline budget: 10k characters.
 - Fresh file context budget: 12k characters.
 - Private checkpoint context: 40k characters.
-- Model-visible healthy enrichment: 8k characters.
 - Model-visible recovery context: 16k characters.
 
 The checkpoint renderer reserves space for the temporal header and
-continuation footer before truncating the middle. Delivery applies its own
-mode-specific middle truncation and records both `injection_budget_chars` and
-actual `injected_chars` after the one-shot consumer wins.
+continuation footer before truncating the middle. Recovery delivery applies its
+own middle truncation and records both `injection_budget_chars` and actual
+`injected_chars` after the one-shot consumer wins.
 
 ## Compatibility boundary
 

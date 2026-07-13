@@ -26,31 +26,33 @@
 - публиковать содержимое checkpoint и приватный код;
 - утверждать, что сработал Rust, только потому что путь настроен.
 
-## Как доказать Rust-инъекцию
+## Как доказать Rust-политику compaction
 
 Для нужной сессии должны одновременно существовать:
 
 - свежий `compacted` event;
 - `checkpoint.json` с `schema_version: 3`, непустым `checkpoint_id` и
-  `scope_path`, совпадающим с root- или child-transcript;
-- audit `checkpoint_saved` и `restore_armed` с совпадающим turn/timestamp;
-- после доставки — ровно один новый `consumed-*.json`;
+  `scope_path`, совпадающим с root transcript;
+- audit `checkpoint_saved`, затем один исход политики: `restore_suppressed` для
+  healthy summary или `restore_armed` для recovery;
+- healthy root compaction не создаёт `pending.json`, `consumed-*.json` или
+  model-visible локальный контекст;
+- subagent compaction не создаёт новый checkpoint и ничего не инжектит;
+- после recovery-доставки — ровно один новый `consumed-*.json`;
 - в `consumed-*.json` и audit `restore_consumed` совпадают `injected_chars` и
-  `injection_budget_chars`;
-- `enrichment` не превышает 8 000 символов, а `recovery` — 16 000, даже если
-  приватный checkpoint достиг локального лимита 40 000;
-- модель получила текст про `additional local compaction` и `PAST steps`.
+  `injection_budget_chars`, а recovery не превышает 16 000 символов;
+- recovery-текст отмечен как root-only и inherited parent history для child.
 
-Если `pending.json` ещё существует, Rust `PreCompact/PostCompact` уже сработали,
-но инъекция пока не была потреблена. Она произойдёт на первом hook-eligible
-`PreToolUse` того же turn (обычный случай для авто-compaction), либо на Bash
-`PostToolUse` после завершения `write_stdin`, либо на `Stop`,
-`SubagentStop`, `SessionStart` или `UserPromptSubmit`.
+Если recovery `pending.json` ещё существует, Rust `PreCompact/PostCompact` уже
+сработали, но инъекция пока не была потреблена. Она произойдёт на первом
+hook-eligible `PreToolUse` того же turn (обычный случай для auto-compaction),
+либо на Bash `PostToolUse` после завершения `write_stdin`, либо на root `Stop`,
+`SessionStart` или `UserPromptSubmit`.
 
-`Stop` использует только собственный `transcript_path`, а `SubagentStop` —
-только `agent_transcript_path`; child-to-root fallback отсутствует. Если путь
-transcript недоступен, состояние хранится как `<session>--turn-<turn>` и может
-быть доставлено только в том же turn, без `SessionStart`/`UserPromptSubmit`.
+`SubagentStop` ничего не инжектит; child-to-root fallback отсутствует. Guard
+распознаёт child по `agent_id` или первой строке `session_meta` и обходит его
+compaction. Если root transcript недоступен, состояние хранится как
+`<session>--turn-<turn>` и может быть доставлено только в том же turn.
 
 Верхнеуровневый code-mode `functions.exec` сам не является lifecycle boundary.
 Его подходящие вложенные вызовы, например `tools.exec_command`, проходят hooks
@@ -62,5 +64,6 @@ transcript недоступен, состояние хранится как `<se
 
 - Registered — бинарник и восемь hooks найдены.
 - Trusted — текущие определения доверены.
-- Real action worked — подтверждена реальная compaction и доставка enrichment.
+- Real action worked — healthy root не инжектит, а recovery доставляется только
+  root-задаче; subagent остаётся без локальной инъекции.
 - Not verified — что осталось недоказанным.

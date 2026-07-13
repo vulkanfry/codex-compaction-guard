@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+## 0.3.3 - 2026-07-13
+
+- Make model-visible delivery root-recovery-only: healthy built-in summaries
+  now create a private checkpoint and immutable generation claim but no
+  pending state or local injection.
+- Bypass subagent compactions using `agent_id`, with the first transcript
+  `session_meta` row as fallback when hook metadata omits it. `SubagentStop`
+  never injects or falls back to root state.
+- Atomically suppress legacy healthy or child pending files during hot upgrade,
+  including concurrent tool/stop delivery races, and retain durable
+  `suppressed-*.json` plus `restore_suppressed` audit evidence.
+- Mark the rare root recovery block as root-only inherited parent history when
+  Codex copies it into a subsequently spawned descendant.
+- Add regressions for healthy no-op, oversized recovery, metadata-only child
+  detection, copied nested metadata, legacy pending suppression, and root/child
+  isolation without `agent_id`.
+
 ## 0.3.2 - 2026-07-13
 
 - Keep the private local checkpoint budget at 40,000 Unicode characters, but

@@ -1,5 +1,5 @@
 {
-  "description": "Native Rust checkpoint guard: preserve Codex state before every compaction and enrich the next continuation.",
+  "description": "Native Rust checkpoint guard: preserve root state and recover only empty, weak, or unavailable Codex compactions.",
   "hooks": {
     "PreCompact": [
       {
@@ -9,7 +9,7 @@
             "type": "command",
             "command": "__CODEX_COMPACTION_GUARD_BINARY__",
             "timeout": 15,
-            "statusMessage": "Saving compaction checkpoint"
+            "statusMessage": "Checking compaction checkpoint"
           }
         ]
       }
@@ -69,7 +69,7 @@
             "type": "command",
             "command": "__CODEX_COMPACTION_GUARD_BINARY__",
             "timeout": 15,
-            "statusMessage": "Checking subagent compaction recovery"
+            "statusMessage": "Checking legacy subagent compaction state"
           }
         ]
       }

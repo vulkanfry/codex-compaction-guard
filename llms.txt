@@ -1,7 +1,7 @@
 # Codex Compaction Guard
 
-Purpose: install a native Rust Codex lifecycle hook that preserves and enriches
-task state across context compaction.
+Purpose: install a native Rust Codex lifecycle hook that checkpoints root task
+state and recovers only failed or weak built-in compactions.
 
 Read first:
 - README.md
@@ -22,19 +22,19 @@ Hook events:
 - SessionStart
 - UserPromptSubmit
 
-Delivery order after PostCompact arms pending state:
+Delivery order after PostCompact arms root recovery state:
 - PreToolUse in the same turn (first hook-eligible direct or nested tool call,
   additionalContext only; canonical Bash for nested exec_command)
 - Bash PostToolUse when write_stdin completes an existing exec session
-- Stop or SubagentStop at turn end
+- root Stop at turn end; SubagentStop never injects
 - SessionStart or UserPromptSubmit as transcript-backed cross-turn fallback
-- normal events are owned by canonical transcript_path; SubagentStop is owned
-  only by agent_transcript_path and never falls back to root state
-- agent_id is metadata, not a state key
+- subagents are bypassed using agent_id or first-row session_meta; they create
+  no new checkpoint or model-visible local context
+- SubagentStop never falls back to root state and only suppresses legacy child pending
 - null-transcript state is keyed by session+turn and is same-turn-only
-- exactly one surface in each ownership scope consumes the one-shot pending file
-- private checkpoint context may reach 40k characters, but model-visible
-  delivery is capped at 8k for healthy enrichment and 16k for recovery
+- exactly one eligible surface in each root recovery scope consumes the one-shot pending file
+- private root checkpoint context may reach 40k characters; healthy summaries
+  add nothing model-visible and recovery is capped at 16k
 
 Required verification:
 1. cargo fmt -- --check
@@ -54,8 +54,8 @@ Security constraints:
 - Do not claim Rust handled a compaction unless its checkpoint has
   schema_version=3, checkpoint_id, matching scope_path, and an audit timestamp
   matching a newly advanced compaction generation.
-- Confirm restore_consumed records actual injected_chars and the selected
-  injection_budget_chars (8000 enrichment or 16000 recovery).
+- Confirm healthy compaction records restore_suppressed with no pending, while
+  recovery records actual injected_chars and injection_budget_chars <=16000.
 
 Install:
 - ./scripts/verify.sh

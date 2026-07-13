@@ -126,6 +126,26 @@ class CompactionGuardTests(unittest.TestCase):
             },
         }
 
+    def child_session_meta(self, child_id="worker-1", agent_path="/root/test-child"):
+        return {
+            "timestamp": "2026-07-12T11:59:59Z",
+            "type": "session_meta",
+            "payload": {
+                "id": child_id,
+                "parent_thread_id": "019f-test",
+                "thread_source": "subagent",
+                "source": {
+                    "subagent": {
+                        "thread_spawn": {
+                            "parent_thread_id": "019f-test",
+                            "depth": 1,
+                            "agent_path": agent_path,
+                        }
+                    }
+                },
+            },
+        }
+
     def invoke(self, event, *, guard_dir=True, extra_env=None):
         env = {**os.environ}
         if guard_dir:
@@ -215,6 +235,62 @@ class CompactionGuardTests(unittest.TestCase):
         self.assertEqual(checkpoint["scope_path"], str(self.transcript.resolve()))
         self.assertTrue(checkpoint["scope_key"].startswith("transcript-"))
         self.assertTrue(checkpoint["cross_turn_safe"])
+        self.assertFalse(checkpoint["is_subagent"])
+
+    def test_subagent_metadata_without_agent_id_bypasses_local_compaction(self):
+        child_transcript = self.root / "metadata-child.jsonl"
+        child_rows = [self.child_session_meta(), *self.rows]
+        child_transcript.write_text(
+            "".join(json.dumps(row) + "\n" for row in child_rows),
+            encoding="utf-8",
+        )
+        compact = {
+            "turn_id": "child-turn",
+            "transcript_path": str(child_transcript),
+        }
+
+        pre = self.invoke(self.event("PreCompact", trigger="auto", **compact))
+        self.assertEqual(pre, {"continue": True})
+        child_rows.append(self.compacted_row())
+        child_transcript.write_text(
+            "".join(json.dumps(row) + "\n" for row in child_rows),
+            encoding="utf-8",
+        )
+        post = self.invoke(self.event("PostCompact", trigger="auto", **compact))
+        self.assertEqual(post, {"continue": True})
+        self.assertFalse(self.transcript_state(child_transcript).exists())
+
+        tool = self.invoke(self.pre_tool_use_event(**compact))
+        self.assertEqual(tool, {"continue": True})
+
+    def test_first_root_session_meta_wins_over_later_copied_subagent_meta(self):
+        root_transcript = self.root / "root-with-copied-meta.jsonl"
+        root_meta = {
+            "timestamp": "2026-07-12T11:59:58Z",
+            "type": "session_meta",
+            "payload": {
+                "id": "019f-test",
+                "source": "vscode",
+                "thread_source": "vscode",
+            },
+        }
+        rows = [root_meta, self.child_session_meta(), *self.rows]
+        root_transcript.write_text(
+            "".join(json.dumps(row) + "\n" for row in rows),
+            encoding="utf-8",
+        )
+
+        self.invoke(
+            self.event(
+                "PreCompact",
+                trigger="auto",
+                transcript_path=str(root_transcript),
+            )
+        )
+        checkpoint = json.loads(
+            (self.transcript_state(root_transcript) / "checkpoint.json").read_text()
+        )
+        self.assertFalse(checkpoint["is_subagent"])
 
     def test_empty_compaction_is_restored_through_stop(self):
         self.invoke(self.event("PreCompact", trigger="auto"))
@@ -241,7 +317,8 @@ class CompactionGuardTests(unittest.TestCase):
         self.assertIn("slot 36", output["reason"])
         self.assertIn("file.txt", output["reason"])
         self.assertIn("still-red", output["reason"])
-        self.assertIn("additional local compaction snapshot", output["reason"])
+        self.assertIn("recovery-only local compaction snapshot", output["reason"])
+        self.assertIn("inherited parent history", output["reason"])
         self.assertIn("PAST steps", output["reason"])
         self.assertIn("Mode: recovery", output["reason"])
         self.assertIn("Built-in summary health: empty", output["reason"])
@@ -256,7 +333,7 @@ class CompactionGuardTests(unittest.TestCase):
         )
         self.assertNotIn("decision", second)
 
-    def test_valid_compaction_is_enriched_once(self):
+    def test_valid_compaction_uses_builtin_summary_without_local_injection(self):
         self.invoke(self.event("PreCompact", trigger="auto"))
         healthy_summary = (
             "Objective: finish the full proof without narrowing. "
@@ -277,7 +354,21 @@ class CompactionGuardTests(unittest.TestCase):
         )
         self._write_rows()
         self.invoke(self.event("PostCompact", trigger="auto"))
-        output = self.invoke(
+        state = self.transcript_state()
+        self.assertFalse((state / "pending.json").exists())
+        self.assertEqual(len(list(state.glob("claimed-generation-*.json"))), 1)
+        audit = [
+            json.loads(line)
+            for line in (state / "audit.jsonl").read_text().splitlines()
+            if json.loads(line)["event"] == "restore_suppressed"
+        ][-1]
+        self.assertEqual(audit["via"], "PostCompact")
+        self.assertEqual(audit["mode"], "enrichment")
+        self.assertEqual(audit["reason"], "healthy_compaction_uses_builtin_summary")
+
+        output = self.invoke(self.pre_tool_use_event())
+        self.assertEqual(output, {"continue": True})
+        stop = self.invoke(
             self.event(
                 "Stop",
                 permission_mode="bypassPermissions",
@@ -285,24 +376,9 @@ class CompactionGuardTests(unittest.TestCase):
                 last_assistant_message="done",
             )
         )
-        self.assertEqual(output["decision"], "block")
-        self.assertIn("model-generated compacted summary", output["reason"])
-        self.assertIn("first genuinely unresolved step", output["reason"])
-        self.assertIn("Finish the full proof without narrowing", output["reason"])
-        self.assertIn("Mode: enrichment", output["reason"])
-        self.assertIn("Built-in summary health: healthy", output["reason"])
+        self.assertEqual(stop, {"continue": True})
 
-        second = self.invoke(
-            self.event(
-                "Stop",
-                permission_mode="bypassPermissions",
-                stop_hook_active=True,
-                last_assistant_message="done after enrichment",
-            )
-        )
-        self.assertNotIn("decision", second)
-
-    def test_oversized_healthy_enrichment_uses_small_model_visible_budget(self):
+    def test_oversized_healthy_compaction_never_becomes_model_visible(self):
         self.inflate_checkpoint_context()
         self.invoke(self.event("PreCompact", trigger="auto"))
         checkpoint_context = self.checkpoint()["restore_context"]
@@ -324,29 +400,18 @@ class CompactionGuardTests(unittest.TestCase):
         self.invoke(self.event("PostCompact", trigger="auto"))
 
         output = self.invoke(self.pre_tool_use_event())
-        context = output["hookSpecificOutput"]["additionalContext"]
-        self.assertLessEqual(len(context), 8_000)
-        self.assertGreater(len(context), 7_000)
-        self.assertIn("<codex_compaction_assessment>", context)
-        self.assertIn("</codex_compaction_assessment>", context)
-        self.assertIn("Mode: enrichment", context)
-        self.assertIn("## Temporal semantics", context)
-        self.assertIn("Checkpoint created at", context)
-        self.assertIn("## Continuation contract", context)
-        self.assertTrue(context.endswith("</codex_local_compaction_enrichment>"))
-
+        self.assertEqual(output, {"continue": True})
         state = self.transcript_state()
-        consumed = json.loads(next(state.glob("consumed-*.json")).read_text())
-        self.assertEqual(consumed["injected_chars"], len(context))
-        self.assertEqual(consumed["injection_budget_chars"], 8_000)
+        self.assertFalse((state / "pending.json").exists())
+        self.assertEqual(len(list(state.glob("consumed-*.json"))), 0)
         audit = [
             json.loads(line)
             for line in (state / "audit.jsonl").read_text().splitlines()
-            if json.loads(line)["event"] == "restore_consumed"
+            if json.loads(line)["event"] == "restore_suppressed"
         ][-1]
+        self.assertEqual(audit["via"], "PostCompact")
         self.assertEqual(audit["mode"], "enrichment")
-        self.assertEqual(audit["injected_chars"], len(context))
-        self.assertEqual(audit["injection_budget_chars"], 8_000)
+        self.assertEqual(audit["reason"], "healthy_compaction_uses_builtin_summary")
 
     def test_oversized_recovery_uses_larger_bounded_model_visible_budget(self):
         self.inflate_checkpoint_context()
@@ -385,7 +450,7 @@ class CompactionGuardTests(unittest.TestCase):
         self.assertEqual(audit["injected_chars"], len(context))
         self.assertEqual(audit["injection_budget_chars"], 16_000)
 
-    def test_malformed_pending_metadata_cannot_expand_assessment_or_audit_mode(self):
+    def test_malformed_legacy_pending_is_suppressed_without_model_context(self):
         self.inflate_checkpoint_context()
         self.invoke(self.event("PreCompact", trigger="auto"))
         healthy_summary = (
@@ -401,37 +466,89 @@ class CompactionGuardTests(unittest.TestCase):
         self._write_rows()
         self.invoke(self.event("PostCompact", trigger="auto"))
 
-        pending_path = self.transcript_state() / "pending.json"
-        pending = json.loads(pending_path.read_text())
-        pending["mode"] = "unexpected-mode-" + "m" * 20_000
-        pending["health"]["level"] = "unexpected-level-" + "l" * 20_000
-        pending["health"]["message_length"] = "not-a-number-" + "s" * 20_000
-        pending["health"]["window_number"] = "not-a-number-" + "w" * 20_000
+        state = self.transcript_state()
+        checkpoint = self.checkpoint()
+        pending_path = state / "pending.json"
+        pending = {
+            "schema_version": 3,
+            "armed_at": "2099-01-01T00:00:00Z",
+            "armed_at_unix": 4_070_908_800.0,
+            "session_id": "019f-test",
+            "turn_id": "turn-1",
+            "scope_key": checkpoint["scope_key"],
+            "scope_path": checkpoint["scope_path"],
+            "cross_turn_safe": True,
+            "agent_id": None,
+            "cwd": str(self.repo),
+            "checkpoint_id": checkpoint["checkpoint_id"],
+            "mode": "unexpected-mode-" + "m" * 20_000,
+            "health": {
+                "level": "unexpected-level-" + "l" * 20_000,
+                "message_length": "not-a-number-" + "s" * 20_000,
+                "window_number": "not-a-number-" + "w" * 20_000,
+            },
+        }
         pending_path.write_text(json.dumps(pending), encoding="utf-8")
 
         output = self.invoke(self.pre_tool_use_event())
-        context = output["hookSpecificOutput"]["additionalContext"]
-        self.assertLessEqual(len(context), 8_000)
-        self.assertIn("Mode: enrichment", context)
-        self.assertIn("Built-in summary health: unknown", context)
-        self.assertIn("summary_chars=unknown", context)
-        self.assertIn("window=unknown", context)
-        self.assertIn("</codex_compaction_assessment>", context)
-        self.assertTrue(context.endswith("</codex_local_compaction_enrichment>"))
-
-        state = self.transcript_state()
-        consumed = json.loads(next(state.glob("consumed-*.json")).read_text())
-        self.assertEqual(consumed["mode"], "enrichment")
-        self.assertEqual(consumed["injected_chars"], len(context))
-        self.assertEqual(consumed["injection_budget_chars"], 8_000)
+        self.assertEqual(output, {"continue": True})
+        self.assertFalse(pending_path.exists())
+        suppressed = json.loads(next(state.glob("suppressed-*.json")).read_text())
+        self.assertEqual(suppressed["suppressed_via"], "PreToolUse")
+        self.assertEqual(
+            suppressed["suppression_reason"],
+            "healthy_compaction_uses_builtin_summary",
+        )
         audit = [
             json.loads(line)
             for line in (state / "audit.jsonl").read_text().splitlines()
-            if json.loads(line)["event"] == "restore_consumed"
+            if json.loads(line)["event"] == "restore_suppressed"
         ][-1]
-        self.assertEqual(audit["mode"], "enrichment")
-        self.assertEqual(audit["injected_chars"], len(context))
-        self.assertEqual(audit["injection_budget_chars"], 8_000)
+        self.assertEqual(audit["via"], "PreToolUse")
+        self.assertEqual(audit["reason"], "healthy_compaction_uses_builtin_summary")
+
+    def test_new_root_precompact_retains_suppressed_legacy_healthy_pending(self):
+        self.invoke(self.event("PreCompact", trigger="auto"))
+        self.rows.append(
+            self.compacted_row("", timestamp="2026-07-12T12:02:00Z")
+        )
+        self._write_rows()
+        self.invoke(self.event("PostCompact", trigger="auto"))
+
+        state = self.transcript_state()
+        pending_path = state / "pending.json"
+        pending = json.loads(pending_path.read_text())
+        old_checkpoint_id = pending["checkpoint_id"]
+        pending["mode"] = "enrichment"
+        pending_path.write_text(json.dumps(pending), encoding="utf-8")
+
+        output = self.invoke(
+            self.event("PreCompact", turn_id="turn-2", trigger="auto")
+        )
+        self.assertEqual(output, {"continue": True})
+        self.assertFalse(pending_path.exists())
+        suppressed = json.loads(next(state.glob("suppressed-*.json")).read_text())
+        self.assertEqual(suppressed["checkpoint_id"], old_checkpoint_id)
+        self.assertEqual(suppressed["suppressed_via"], "PreCompact")
+        self.assertEqual(
+            suppressed["suppression_reason"],
+            "healthy_compaction_uses_builtin_summary",
+        )
+
+        checkpoint = self.checkpoint()
+        self.assertEqual(checkpoint["turn_id"], "turn-2")
+        self.assertNotEqual(checkpoint["checkpoint_id"], old_checkpoint_id)
+        policy_events = [
+            row
+            for row in map(
+                json.loads, (state / "audit.jsonl").read_text().splitlines()
+            )
+            if row["event"] in {"restore_suppressed", "checkpoint_saved"}
+        ]
+        self.assertEqual(policy_events[-2]["event"], "restore_suppressed")
+        self.assertEqual(policy_events[-2]["via"], "PreCompact")
+        self.assertEqual(policy_events[-1]["event"], "checkpoint_saved")
+        self.assertEqual(policy_events[-1]["turn_id"], "turn-2")
 
     def test_weak_compaction_is_classified_as_recovery(self):
         self.invoke(self.event("PreCompact", trigger="auto"))
@@ -641,7 +758,11 @@ class CompactionGuardTests(unittest.TestCase):
 
     def test_transcript_scope_isolates_compactions_without_agent_id(self):
         child_transcript = self.root / "child-rollout.jsonl"
-        child_transcript.write_text(self.transcript.read_text(encoding="utf-8"), encoding="utf-8")
+        child_rows = [self.child_session_meta(), *self.rows]
+        child_transcript.write_text(
+            "".join(json.dumps(row) + "\n" for row in child_rows),
+            encoding="utf-8",
+        )
 
         root_pre = self.event("PreCompact", turn_id="root-turn", trigger="auto")
         root_post = self.event("PostCompact", turn_id="root-turn", trigger="auto")
@@ -662,30 +783,23 @@ class CompactionGuardTests(unittest.TestCase):
         self.invoke(child_pre)
         self.rows.append(self.compacted_row())
         self._write_rows()
-        child_transcript.write_text(self.transcript.read_text(encoding="utf-8"), encoding="utf-8")
+        child_rows.append(self.compacted_row())
+        child_transcript.write_text(
+            "".join(json.dumps(row) + "\n" for row in child_rows),
+            encoding="utf-8",
+        )
         self.invoke(root_post)
         self.invoke(child_post)
 
         state_dirs = [path for path in self.state.iterdir() if path.is_dir()]
         pending_dirs = [path for path in state_dirs if (path / "pending.json").is_file()]
-        self.assertEqual(len(pending_dirs), 2)
-        checkpoint_transcripts = {
-            json.loads((path / "checkpoint.json").read_text())["transcript_path"]
-            for path in pending_dirs
-        }
-        self.assertEqual(checkpoint_transcripts, {str(self.transcript), str(child_transcript)})
+        self.assertEqual(pending_dirs, [self.transcript_state()])
+        self.assertFalse(self.transcript_state(child_transcript).exists())
 
         root_output = self.invoke(
             self.pre_tool_use_event(turn_id="root-turn", transcript_path=str(self.transcript))
         )
         self.assertEqual(root_output["hookSpecificOutput"]["hookEventName"], "PreToolUse")
-        child_pending = next(
-            path / "pending.json"
-            for path in pending_dirs
-            if json.loads((path / "checkpoint.json").read_text())["transcript_path"]
-            == str(child_transcript)
-        )
-        self.assertTrue(child_pending.exists())
 
         child_output = self.invoke(
             self.pre_tool_use_event(
@@ -693,8 +807,7 @@ class CompactionGuardTests(unittest.TestCase):
                 transcript_path=str(child_transcript),
             )
         )
-        self.assertEqual(child_output["hookSpecificOutput"]["hookEventName"], "PreToolUse")
-        self.assertFalse(child_pending.exists())
+        self.assertEqual(child_output, {"continue": True})
 
     def test_transcript_scope_canonicalizes_symlink_aliases(self):
         transcript_alias = self.root / "rollout-alias.jsonl"
@@ -725,7 +838,7 @@ class CompactionGuardTests(unittest.TestCase):
         self.assertEqual(output["hookSpecificOutput"]["hookEventName"], "PreToolUse")
         self.assertFalse((state / "pending.json").exists())
 
-    def test_child_subagent_stop_consumes_child_only(self):
+    def test_subagent_stop_suppresses_legacy_child_pending_only(self):
         self.invoke(self.event("PreCompact", turn_id="root-turn", trigger="auto"))
         self.rows.append(self.compacted_row())
         self._write_rows()
@@ -776,15 +889,19 @@ class CompactionGuardTests(unittest.TestCase):
                 last_assistant_message="child finished",
             )
         )
-        self.assertEqual(output["decision"], "block")
-        self.assertIn("Child scope only", output["reason"])
+        self.assertEqual(output, {"continue": True})
         self.assertFalse(child_pending.exists())
         self.assertTrue(root_pending.exists())
-        child_consumed = list(child_state.glob("consumed-*.json"))
-        self.assertEqual(len(child_consumed), 1)
+        self.assertEqual(len(list(child_state.glob("consumed-*.json"))), 0)
+        child_suppressed = list(child_state.glob("suppressed-*.json"))
+        self.assertEqual(len(child_suppressed), 1)
         self.assertEqual(
-            json.loads(child_consumed[0].read_text())["consumed_via"],
+            json.loads(child_suppressed[0].read_text())["suppressed_via"],
             "SubagentStop",
+        )
+        self.assertEqual(
+            json.loads(child_suppressed[0].read_text())["suppression_reason"],
+            "subagent_local_compaction_disabled",
         )
 
         root_output = self.invoke(
@@ -802,9 +919,10 @@ class CompactionGuardTests(unittest.TestCase):
     def test_two_children_compact_concurrently_without_agent_id(self):
         child_a = self.root / "child-a.jsonl"
         child_b = self.root / "child-b.jsonl"
-        base = self.transcript.read_text(encoding="utf-8")
-        child_a.write_text(base, encoding="utf-8")
-        child_b.write_text(base, encoding="utf-8")
+        base_a = json.dumps(self.child_session_meta("child-a", "/root/child-a")) + "\n" + self.transcript.read_text(encoding="utf-8")
+        base_b = json.dumps(self.child_session_meta("child-b", "/root/child-b")) + "\n" + self.transcript.read_text(encoding="utf-8")
+        child_a.write_text(base_a, encoding="utf-8")
+        child_b.write_text(base_b, encoding="utf-8")
         pre_events = [
             self.event(
                 "PreCompact",
@@ -821,8 +939,8 @@ class CompactionGuardTests(unittest.TestCase):
         ]
         self.invoke_parallel(pre_events)
         compacted = json.dumps(self.compacted_row()) + "\n"
-        child_a.write_text(base + compacted, encoding="utf-8")
-        child_b.write_text(base + compacted, encoding="utf-8")
+        child_a.write_text(base_a + compacted, encoding="utf-8")
+        child_b.write_text(base_b + compacted, encoding="utf-8")
         post_events = [
             self.event(
                 "PostCompact",
@@ -841,7 +959,7 @@ class CompactionGuardTests(unittest.TestCase):
 
         states = [self.transcript_state(child_a), self.transcript_state(child_b)]
         self.assertNotEqual(states[0], states[1])
-        self.assertTrue(all((state / "pending.json").exists() for state in states))
+        self.assertTrue(all(not state.exists() for state in states))
         outputs = self.invoke_parallel(
             [
                 self.pre_tool_use_event(
@@ -854,10 +972,9 @@ class CompactionGuardTests(unittest.TestCase):
                 ),
             ]
         )
-        self.assertEqual(sum("hookSpecificOutput" in output for output in outputs), 2)
-        self.assertTrue(all(not (state / "pending.json").exists() for state in states))
+        self.assertEqual(outputs, [{"continue": True}, {"continue": True}])
 
-    def test_child_tool_and_stop_race_consumes_child_once(self):
+    def test_child_tool_and_stop_race_suppresses_legacy_pending_once(self):
         self.invoke(self.event("PreCompact", turn_id="root-turn", trigger="auto"))
         self.rows.append(self.compacted_row())
         self._write_rows()
@@ -868,8 +985,6 @@ class CompactionGuardTests(unittest.TestCase):
         child_transcript.write_text(self.transcript.read_text(encoding="utf-8"), encoding="utf-8")
         child_context = {
             "turn_id": "child-turn",
-            "agent_id": "worker-1",
-            "agent_type": "reviewer",
             "transcript_path": str(child_transcript),
         }
         self.invoke(self.event("PreCompact", trigger="auto", **child_context))
@@ -886,10 +1001,16 @@ class CompactionGuardTests(unittest.TestCase):
         )
         self.invoke(self.event("PostCompact", trigger="auto", **child_context))
         child_state = self.transcript_state(child_transcript)
+        self.assertTrue((child_state / "pending.json").exists())
+        delivery_context = {
+            **child_context,
+            "agent_id": "worker-1",
+            "agent_type": "reviewer",
+        }
 
         outputs = self.invoke_parallel(
             [
-                self.pre_tool_use_event(**child_context),
+                self.pre_tool_use_event(**delivery_context),
                 self.event(
                     "SubagentStop",
                     turn_id="child-turn",
@@ -907,9 +1028,11 @@ class CompactionGuardTests(unittest.TestCase):
             "hookSpecificOutput" in output or output.get("decision") == "block"
             for output in outputs
         )
-        self.assertEqual(injections, 1)
+        self.assertEqual(injections, 0)
+        self.assertTrue(all(output == {"continue": True} for output in outputs))
         self.assertFalse((child_state / "pending.json").exists())
-        self.assertEqual(len(list(child_state.glob("consumed-*.json"))), 1)
+        self.assertEqual(len(list(child_state.glob("consumed-*.json"))), 0)
+        self.assertEqual(len(list(child_state.glob("suppressed-*.json"))), 1)
         self.assertTrue(root_pending.exists())
 
     def test_null_transcript_is_same_turn_only(self):
@@ -1174,7 +1297,7 @@ class CompactionGuardTests(unittest.TestCase):
         outputs = [json.loads(stdout) for stdout, _ in results]
         self.assertEqual(sum(output.get("decision") == "block" for output in outputs), 1)
 
-    def test_received_pre_tool_use_delivers_enrichment_early_in_same_turn(self):
+    def test_received_pre_tool_use_delivers_recovery_early_in_same_turn(self):
         self.invoke(self.event("PreCompact", trigger="auto"))
         before_arming = self.invoke(self.pre_tool_use_event())
         self.assertEqual(before_arming, {"continue": True})
@@ -1334,7 +1457,7 @@ class CompactionGuardTests(unittest.TestCase):
         self.assertNotIn("decision", stop_after_race)
         self.assertEqual(len(list(session_state.glob("consumed-*.json"))), 1)
 
-    def test_subagent_pre_tool_use_is_scoped_to_transcript_state(self):
+    def test_subagent_pre_tool_use_never_consumes_root_or_creates_child_state(self):
         agent_transcript = self.root / "agent-rollout.jsonl"
         agent_transcript.write_text(self.transcript.read_text(encoding="utf-8"), encoding="utf-8")
         self.invoke(self.event("PreCompact", trigger="auto"))
@@ -1383,7 +1506,8 @@ class CompactionGuardTests(unittest.TestCase):
             )
         )
         agent_pending = self.transcript_state(agent_transcript) / "pending.json"
-        self.assertTrue(agent_pending.exists())
+        self.assertFalse(agent_pending.exists())
+        self.assertFalse(self.transcript_state(agent_transcript).exists())
 
         output = self.invoke(
             self.pre_tool_use_event(
@@ -1392,9 +1516,7 @@ class CompactionGuardTests(unittest.TestCase):
                 transcript_path=str(agent_transcript),
             )
         )
-        self.assertEqual(
-            output["hookSpecificOutput"]["hookEventName"], "PreToolUse"
-        )
+        self.assertEqual(output, {"continue": True})
         self.assertFalse(agent_pending.exists())
         self.assertTrue(root_pending.exists())
 

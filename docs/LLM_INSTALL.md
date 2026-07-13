@@ -113,8 +113,12 @@ CODEX_COMPACTION_GUARD_EXECUTABLE="${CODEX_HOME:-$HOME/.codex}/hooks/compaction_
 
 ### 7. Real compaction proof
 
-Use a fresh non-critical Codex task. Add enough context or explicitly request a
-manual compaction. After it completes, inspect only metadata:
+Use a fresh non-critical root Codex task. Add enough context or explicitly
+request a manual compaction. After it completes, inspect only metadata. One
+live compaction proves only the branch it actually triggers; use the installed
+lifecycle suite as evidence for the mutually exclusive healthy, recovery, and
+subagent branches. Run three live scenarios only when full live-matrix proof is
+required.
 
 ```bash
 state_root="${CODEX_HOME:-$HOME/.codex}/compaction-guard"
@@ -130,37 +134,41 @@ Required evidence:
 - checkpoint timestamp matches the new compaction;
 - `schema_version` is `3`;
 - `checkpoint_id` is non-empty;
-- `scope_path` matches the root or child transcript that compacted;
-- audit contains `checkpoint_saved` and `restore_armed`;
-- exactly one path consumes the pending snapshot; when the task keeps running
-  after compaction the expected consumer is a hook-eligible `PreToolUse` in the
-  same turn, Bash `PostToolUse` for a `write_stdin` completion, or otherwise
-  `Stop` or a fallback surface;
-- the consumed record's `consumed_via` matches that surface;
-- the consumed record and `restore_consumed` audit row agree on
-  `injected_chars` and `injection_budget_chars`;
-- healthy `enrichment` delivers no more than 8,000 characters; `recovery`
-  delivers no more than 16,000, even when the private checkpoint is 40,000;
-- `SubagentStop` consumes only the directory owned by
-  `agent_transcript_path` and never falls back to root pending state;
-- the injection contains the local-compaction and past-steps semantics;
-- the model continues from an unresolved step instead of asking what to do.
+- `scope_path` matches the root transcript that compacted;
+- audit contains `checkpoint_saved` and then exactly one policy outcome:
+  `restore_suppressed` for a healthy summary or `restore_armed` for recovery;
+- healthy root compaction creates no `pending.json`, no `consumed-*.json`, and
+  no model-visible local context;
+- subagent compaction creates no new checkpoint or pending state, even when
+  `agent_id` is absent but first-row `session_meta` identifies a subagent;
+- for recovery, exactly one path consumes the pending snapshot: same-turn
+  `PreToolUse`, Bash `PostToolUse`, root `Stop`, or a root fallback surface;
+- the recovery consumed record and `restore_consumed` audit row agree on
+  `consumed_via`, `injected_chars`, and `injection_budget_chars`;
+- recovery delivers no more than 16,000 characters even when the private root
+  checkpoint is 40,000;
+- `SubagentStop` never injects and never falls back to root pending state;
+- a recovery injection contains the local-compaction, inherited-parent, and
+  past-steps semantics, then continues from an unresolved root step.
 
 ## Failure handling
 
 - `modified` or `untrusted`: use `/hooks`; do not edit trust hashes manually.
 - No fresh checkpoint: restart Codex or use a fresh task, then retry.
-- Fresh checkpoint but no consume: inspect whether the task stopped, resumed, or
-  received a user prompt; the fallback may still be armed.
+- Fresh checkpoint plus `restore_suppressed`: healthy behavior is complete;
+  there should be no consume or model-visible local context.
+- Fresh checkpoint plus `restore_armed` but no consume: inspect whether the
+  root task stopped, resumed, or received a user prompt; recovery may still be
+  armed.
 - A `<session>--turn-*` directory has no proven transcript ownership and can
   deliver only inside the same turn; `SessionStart` and `UserPromptSubmit`
   intentionally leave it pending.
 - Outer code-mode `functions.exec` rows are not lifecycle boundaries; inspect
   eligible nested tools such as canonical `Bash` before diagnosing a miss.
-- Empty built-in summary: expected mode is `recovery`.
-- Healthy built-in summary: expected mode is `enrichment`.
-- A 40k checkpoint is not a 40k model injection: inspect `restore_consumed` for
-  the mode-specific 8k/16k delivery budget and actual injected size.
+- Empty, weak, or unavailable built-in summary: expected mode is `recovery`.
+- Healthy built-in summary: expected outcome is `restore_suppressed`, with no
+  pending or injection.
+- A 40k checkpoint is not a 40k model injection: recovery is capped at 16k.
 - Hook timeout: inspect the private audit file; the hook must still fail open.
 
 ## Required final report
